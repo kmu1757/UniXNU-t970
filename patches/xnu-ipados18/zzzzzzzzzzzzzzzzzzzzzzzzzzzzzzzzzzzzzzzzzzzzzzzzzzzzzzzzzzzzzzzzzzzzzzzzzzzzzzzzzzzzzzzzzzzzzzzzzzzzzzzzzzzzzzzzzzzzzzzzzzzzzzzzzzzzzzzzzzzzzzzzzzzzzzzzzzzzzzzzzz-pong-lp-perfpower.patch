@@ -1,0 +1,46 @@
+diff --git a/bsd/dev/pong_wifi_tools.c b/bsd/dev/pong_wifi_tools.c
+index 66ac89a..30831f5 100644
+--- a/bsd/dev/pong_wifi_tools.c
++++ b/bsd/dev/pong_wifi_tools.c
+@@ -271,6 +271,9 @@ fw_save(char *reply, size_t cap)
+  * Optional, off by default, not yet tried on the device: boot argument pong_lp_extra bit 0 also disables
+  *   com.apple.spaceattributiond  restarted every 10 s on 11-14; StorageUI (Settings > General > iPad Storage) links its
+  *                                framework, so that screen is the likeliest to freeze the same way.
++ * and pong_lp_extra bit 1 (smooth session, 11-17) disables
++ *   com.apple.PerfPowerServices  power logging; on half95m (11-17) it took 11 of 16 s of CPU during a drag and 53 of 70 s idle,
++ *                                restarted once (PID 76 -> 3813), about as busy as backboardd. Its plxpclogger lookups then fail.
+  *   com.apple.locationd     back in the root image for GPS / location (work/gps_camera_scope/DESIGN.md); kept disabled
+  *                           unless boot argument pong_loc bit 0 (then dev.unixnu.pong.locd feeds it), so images without
+  *                           pong_loc behave as before from their second boot on.
+@@ -285,6 +288,7 @@ static const char lp_jobs[] = "<key>com.apple.fairplayd.A2</key><true/>";
+ /* left out with boot argument pong_bt bit 0: bsd/dev/pong_bt.c then serves UART.SK (z101, not tried on the device) */
+ static const char lp_bt[] = "<key>com.apple.bluetoothd</key><true/>";
+ static const char lp_storage[] = "<key>com.apple.spaceattributiond</key><true/>";   /* pong_lp_extra bit 0 */
++static const char lp_perf[] = "<key>com.apple.PerfPowerServices</key><true/>";     /* pong_lp_extra bit 1 */
+ static const char lp_loc[] = "<key>com.apple.locationd</key><true/>";              /* left out with pong_loc bit 0 */
+ static const char lp_tail[] = "</dict></plist>\n";
+ 
+@@ -343,8 +347,9 @@ static int
+ lp_write(int disable)
+ {
+ 	char body[512];
+-	int n = snprintf(body, sizeof(body), "%s%s%s%s%s%s", lp_head, disable ? lp_jobs : "", disable && !lp_bt_served() ? lp_bt : "",
+-	    disable && (lp_extra() & 1) ? lp_storage : "", disable && !lp_loc_on() ? lp_loc : "", lp_tail);
++	int n = snprintf(body, sizeof(body), "%s%s%s%s%s%s%s", lp_head, disable ? lp_jobs : "", disable && !lp_bt_served() ? lp_bt : "",
++	    disable && (lp_extra() & 1) ? lp_storage : "", disable && (lp_extra() & 2) ? lp_perf : "",
++	    disable && !lp_loc_on() ? lp_loc : "", lp_tail);
+ 	int e;
+ 
+ 	if (n <= 0 || n >= (int)sizeof(body)) {
+@@ -371,9 +376,9 @@ pong_launch_policy_usb(char *reply, size_t cap, const char *args)
+ 	} else if (args && strncmp(args, "clear", 5) == 0) {
+ 		(void)lp_write(0);
+ 	}
+-	(void)snprintf(reply, cap, "launchpolicy: %s (rc %d); disables com.apple.fairplayd.A2, com.apple.bluetoothd%s from the next boot\n",
++	(void)snprintf(reply, cap, "launchpolicy: %s (rc %d); disables com.apple.fairplayd.A2, com.apple.bluetoothd%s%s from the next boot\n",
+ 	    wt.lp_rc < 0 ? "not written this boot" : wt.lp_rc == 0 ? "written" : "write failed", wt.lp_rc,
+-	    (lp_extra() & 1) ? ", com.apple.spaceattributiond" : "");
++	    (lp_extra() & 1) ? ", com.apple.spaceattributiond" : "", (lp_extra() & 2) ? ", com.apple.PerfPowerServices" : "");
+ 	return wt.lp_rc > 0 ? -1 : 0;
+ }
+ 
