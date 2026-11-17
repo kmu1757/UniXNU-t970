@@ -1,0 +1,98 @@
+diff --git a/bsd/dev/pong_wifi_link.c b/bsd/dev/pong_wifi_link.c
+index 31a8fa7..50b4da3 100644
+--- a/bsd/dev/pong_wifi_link.c
++++ b/bsd/dev/pong_wifi_link.c
+@@ -3919,11 +3919,43 @@ pong_wifi_stage4(char *reply, size_t reply_len, int what)
+ volatile void *pong_wifi_ep_cfg(unsigned int off);
+ void pong_wifi_stack_table(uint64_t table_pa);
+ 
+-/* The endpoint's configuration space, one of the windows `wifiup` mapped. */
++/*
++ * The endpoint's configuration space, one of the windows `wifiup` mapped. Only while the link is up: a request
++ * with no link is never answered and stalls the bus (rui T970WifiStack.cpp), which looks like a whole-tablet hang
++ * with no panic (11-17 half95f1 after `s3b w3`). Checked on the root port's own registers (no request on the
++ * wire): GDSC and clocks running, PARF LTSSM enable, DBI link up, data link layer active. Any LTSSM state of a
++ * trained link passes (L1 wakes up for the request). The first refusals go to pmsg with what was seen.
++ */
+ volatile void *
+ pong_wifi_ep_cfg(unsigned int off)
+ {
+-	return off < 4096u ? (volatile void *)wl_ptr(CFGSPACE + off) : NULL;
++	static unsigned refused;
++	uint32_t gdsc = 0, halt = 0, ltssm = 0, dbg0 = 0, dbg1 = 0, lnk = 0;
++
++	if (off >= 4096u) {
++		return NULL;
++	}
++	if (wl_is_up && ((gdsc = rd(GCC_PCIE0_GDSCR)) & (1u << 31)) &&
++	    !((halt = wl_halt()) & (WL_HALT_PARF | WL_HALT_DBI))) {
++		ltssm = rd(PARF_LTSSM);
++		dbg0 = rd(DBI_DEBUG0);
++		dbg1 = rd(DBI_DEBUG1);
++		lnk = rd(DBI_LNKCTL);
++		if ((ltssm & (1u << 8)) && (dbg1 & (1u << 4)) && (lnk & (1u << 29))) {
++			return (volatile void *)wl_ptr(CFGSPACE + off);
++		}
++	}
++	if (refused++ < 4) {
++		char line[160];
++		int n = snprintf(line, sizeof(line),
++		    "[PONG_WIFI] epcfg nolink nolink off %x up %d gdsc %x halt %x ltssm %x dbg0 %x dbg1 %x lnk %x\n",
++		    off, wl_is_up, gdsc, halt, ltssm, dbg0, dbg1, lnk);
++
++		if (n > 0) {
++			pong_ramoops_diagnostic_write(line, n < (int)sizeof(line) ? n : (int)sizeof(line) - 1);
++		}
++	}
++	return NULL;
+ }
+ 
+ /* The table `wifis3b bank` loads into TTBR0 instead of the test arena's; set before the bank is programmed. */
+diff --git a/bsd/dev/pong_wifi_stack.c b/bsd/dev/pong_wifi_stack.c
+index c0f9a1e..3e32896 100644
+--- a/bsd/dev/pong_wifi_stack.c
++++ b/bsd/dev/pong_wifi_stack.c
+@@ -636,28 +636,43 @@ ws_run(void)
+ 	WS_STAGE(6, pong_wifi_stage3b(ws.stage_line, sizeof(ws.stage_line), 3));
+ 	ws.stage_line[0] = '\0';
+ 
++	/*
++	 * Marks between the steps (11-17 half95f1: the tablet stopped answering after `s3b w3`, no line of this part in
++	 * pmsg). Short lines with the step twice, so a few flipped bits still leave it readable. They go through ws_log,
++	 * so `wifilog` has them too. pong_wifi_ep_cfg() refuses config space without the link (pong_wifi_link.c).
++	 */
++	ws_log(6, "w8a w8a cfg");
+ 	ws.stage = 8;
+ 	if (ws_cfg_read(0x10, 4, &v) || !(v & ~0xfu) || !ws_caps()) {
+ 		ws.stage = -8;
++		ws_log(3, "w8x w8x no bar or caps");
+ 		return;
+ 	}
+ 	ws.bar_pa = v & ~0xfu;
++	native_wifi_logf(6, "w8b w8b bar %llx msi %x pcie %x", (unsigned long long)ws.bar_pa, ws.msi_cap, ws.pcie_cap);
+ 	{
+ 		const vm_offset_t bar = ml_io_map((vm_offset_t)ws.bar_pa, WS_BAR_BYTES);
+ 
+ 		ws.bar = (uint8_t *)bar;
+ 	}
++	ws_log(6, ws.bar ? "w8c w8c mapped" : "w8x w8x map failed");
+ 	if (!ws.bar || ws_cfg_write(0x04, 2, 0x6)) {    /* memory decoding and bus mastering, from here on untouched */
+ 		ws.stage = -8;
++		ws_log(3, "w8x w8x command");
+ 		return;
+ 	}
++	v = 0;
++	(void)ws_cfg_read(0x04, 4, &v);
++	native_wifi_logf(6, "w8d w8d command %x", v);
+ 	ws_board = (struct nw_board){
+ 		.bar = ws.bar, .bar_len = WS_BAR_BYTES, .device_id = WS_DEVICE_ID, .msi_cap = (uint16_t)ws.msi_cap,
+ 		.irq_base = WS_IRQ_BASE, .cfg_read = ws_cfg_read, .cfg_write = ws_cfg_write,
+ 		.msi_target = ws_msi_target, .map_phys = ws_map_phys,
+ 	};
+ 	WS_STAGE(11, t970_wifi_net_prepare());         /* the station events get their handlers before the start */
++	ws_log(6, "w9a w9a start");                    /* next: the module's own lines, `pci: device control` first */
+ 	WS_STAGE(9, nw_wifi_start(&ws_platform, &ws_board));
++	ws_log(6, "w9b w9b started");
+ 	ws.stage = 10;
+ 	for (;;) {
+ 		const int busy = nw_wifi_step();
