@@ -1,0 +1,190 @@
+diff --git a/bsd/dev/pong_cpu_perf.c b/bsd/dev/pong_cpu_perf.c
+index d191863..54d85a6 100644
+--- a/bsd/dev/pong_cpu_perf.c
++++ b/bsd/dev/pong_cpu_perf.c
+@@ -91,6 +91,10 @@ extern processor_t cpu_to_processor(int cpu);
+ extern kern_return_t processor_exit_from_user(processor_t processor);
+ extern kern_return_t processor_start_from_user(processor_t processor);
+ 
++/* Input boost (modes 3, 4): until g_boost_until every domain runs at its cap (the thermal limit still applies). */
++static uint64_t g_boost_span, g_boost_until;
++static uint32_t g_boosts;
++
+ /* Mode 4 parking: wanted, CPUs now off (bit per CPU), switch-offs, switch-ons, last failure (CPU << 8 | kr). */
+ static int g_park, g_park_err;
+ static uint32_t g_parked, g_parks, g_unparks;
+@@ -235,6 +239,9 @@ governor(void)
+ 			while (row < cap && g_lut[d][row] < want) {
+ 				row++;
+ 			}
++			if (!dark && now < __atomic_load_n(&g_boost_until, __ATOMIC_RELAXED)) {
++				row = cap;              /* a finger is on the screen (pong_cpu_perf_input) */
++			}
+ 			if (row != g_row[d]) {
+ 				*(volatile uint32_t *)(g_base[d] + EPSS_REG_PERF_STATE) = row;
+ 				g_row[d] = row;
+@@ -256,8 +263,8 @@ pong_cpu_perf_status(char *out, size_t cap)
+ 		    g_rows[d] ? g_lut[d][g_row[d]] / 1000 : 0, g_util[d]);
+ 	}
+ 	if (n > 0 && n < (int)cap) {
+-		n += snprintf(out + n, cap - (size_t)n, " | dark=%d park=%d off=%x n=%u/%u err=%x", pong_dark_idle(), g_park,
+-		    g_parked, g_parks, g_unparks, g_park_err);
++		n += snprintf(out + n, cap - (size_t)n, " | dark=%d park=%d off=%x n=%u/%u err=%x boosts=%u", pong_dark_idle(),
++		    g_park, g_parked, g_parks, g_unparks, g_park_err, g_boosts);
+ 	}
+ 	if (n > 0 && n < (int)cap - 1) {
+ 		out[n++] = '\n';
+@@ -266,6 +273,34 @@ pong_cpu_perf_status(char *out, size_t cap)
+ 	return n;
+ }
+ 
++/*
++ * A touch or pen event (pong_fts.c): every domain goes to its cap now, not at the next 50 ms sample, and stays
++ * there for pong_cpu_boost ms (default 1000, 0 = no boost) after the last event -- what stock iOS and Android do,
++ * so the first frames of a drag do not run at the lowest clock. Nothing happens in modes 1 and 2 or in the dark.
++ */
++void
++pong_cpu_perf_input(void)
++{
++	if (g_mode < 3 || g_boost_span == 0 || pong_dark_idle()) {
++		return;
++	}
++	const uint64_t now = mach_absolute_time();
++	const bool was = now < __atomic_load_n(&g_boost_until, __ATOMIC_RELAXED);
++
++	__atomic_store_n(&g_boost_until, now + g_boost_span, __ATOMIC_RELAXED);
++	if (was) {
++		return;
++	}
++	g_boosts++;
++	for (unsigned d = 0; d < EPSS_NUM_DOMAINS; d++) {
++		if (g_base[d] && g_row[d] != g_cap[d]) {
++			*(volatile uint32_t *)(g_base[d] + EPSS_REG_PERF_STATE) = g_cap[d];
++			g_row[d] = g_cap[d];
++			g_writes++;
++		}
++	}
++}
++
+ /* USB `cpuperf limit C` (30..110) and `cpuperf park 0|1`: change the running governor (mode 3 or 4). 0 done, -1 refused. */
+ int
+ pong_cpu_perf_set(const char *what, int value)
+@@ -404,6 +439,9 @@ pong_cpu_perf_init(void)
+ 
+ 	g_mode = perf_arg;
+ 	PE_parse_boot_argn("pong_thermal_c", &g_limit_c, sizeof(g_limit_c));
++	unsigned boost_ms = 1000;
++	PE_parse_boot_argn("pong_cpu_boost", &boost_ms, sizeof(boost_ms));
++	nanoseconds_to_absolutetime((uint64_t)(boost_ms > 5000 ? 5000 : boost_ms) * NSEC_PER_MSEC, &g_boost_span);
+ 	thread_t th = THREAD_NULL;
+ 	if (kernel_thread_start(pong_cpu_perf_worker, (void *)(uintptr_t)perf_arg, &th) == KERN_SUCCESS) {
+ 		thread_deallocate(th);
+diff --git a/bsd/dev/pong_fts.c b/bsd/dev/pong_fts.c
+index 8e41d40..2d51484 100644
+--- a/bsd/dev/pong_fts.c
++++ b/bsd/dev/pong_fts.c
+@@ -10,6 +10,7 @@
+ #if defined(PONG)
+ #include <kern/clock.h>
+ #include <kern/thread.h>
++#include <sys/pong_cpu_perf.h>
+ #include <libkern/libkern.h>
+ #include <mach/mach_types.h>
+ #include <pexpert/pexpert.h>
+@@ -842,6 +843,7 @@ fts_touch_thread(__unused void *param, __unused wait_result_t wr)
+ 					if (post_y > 65535) post_y = 65535;
+ 
+ 					pong_touch_post(action, tid, post_x, post_y);
++					pong_cpu_perf_input();     /* governor input boost (modes 3, 4) */
+ 
+ 					if (logged_touches < 4) {
+ 						logged_touches++;
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 4416b42..09c06ab 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -3682,11 +3682,21 @@ pong_usb_ctl_thread(void *param, __unused wait_result_t result)
+ 				quiet = 0;
+ 			}
+ 			/* a boot image upload (bootput / bootpatch) takes one 512-byte packet per pass: 2 ms passes cap it at ~220 KB/s */
++			/* no host and no controller event for 2 s (unplugged): 20 ms passes, the first event of a plug-in brings
++			 * back 2 ms (power analysis 11-17: 500 wake-ups a second for an empty socket) */
++			static unsigned events_seen, idle_passes;
++
++			if (diag_event_count != events_seen || ctl_configured) {
++				events_seen = diag_event_count;
++				idle_passes = 0;
++			} else if (idle_passes < 1000) {
++				idle_passes++;
++			}
+ 			if (((ncm_alt == 1 || mux_on) && quiet < 500) || pong_boot_rx_active()) {
+ 				quiet++;
+ 				delay_for_interval(100, NSEC_PER_USEC);
+ 			} else {
+-				delay_for_interval(2, NSEC_PER_MSEC);
++				delay_for_interval(idle_passes >= 1000 ? 20 : 2, NSEC_PER_MSEC);
+ 			}
+ 		}
+ 	}
+diff --git a/bsd/dev/pong_wifi_stack.c b/bsd/dev/pong_wifi_stack.c
+index 6ed089d..c0f9a1e 100644
+--- a/bsd/dev/pong_wifi_stack.c
++++ b/bsd/dev/pong_wifi_stack.c
+@@ -27,6 +27,7 @@
+ #include <kern/clock.h>
+ #include <kern/kalloc.h>
+ #include <kern/thread.h>
++#include <kern/sched_prim.h>
+ #include <libkern/libkern.h>
+ #include <mach/mach_types.h>
+ #include <mach/vm_param.h>
+@@ -39,6 +40,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern void *IOMallocContiguous(vm_size_t size, vm_size_t alignment, IOPhysicalAddress *physicalAddress);
+ extern void pong_ramoops_diagnostic_write(const char *buf, int len);
+ extern void delay_for_interval(uint32_t interval, uint32_t scale_factor);
++extern int pong_dark_idle(void);        /* bsd/dev/pong_backlight_t970.c: the panel is off (z134) */
+ extern uint64_t mach_absolute_time(void);
+ extern uint64_t kvtophys(vm_offset_t va);
+ extern boolean_t pmap_valid_page(ppnum_t pn);
+@@ -204,6 +206,7 @@ void
+ pong_wifi_wake(void)
+ {
+ 	__atomic_store_n(&ws.wake, 1, __ATOMIC_RELEASE);
++	thread_wakeup((event_t)&ws.wake);
+ }
+ 
+ void
+@@ -688,9 +691,18 @@ ws_run(void)
+ 		if (busy < 0) {
+ 			delay_for_interval(100, 1000000u);
+ 		} else {
+-			/* 1 ms while frames move, else up to 10 ms unless the network side has something to send */
+-			for (unsigned int ms = busy ? 9 : 0; ms < 10 && !__atomic_exchange_n(&ws.wake, 0, __ATOMIC_ACQ_REL); ms++) {
+-				delay_for_interval(1, 1000000u);
++			/*
++			 * 1 ms while frames move, else 10 ms (40 with the screen off) unless the network side has something to
++			 * send. The idle wait is one timed sleep that pong_wifi_wake() cuts short; it was ten 1 ms sleeps, a
++			 * thousand wake-ups a second with nothing to do (power analysis 11-17). The step still runs every 10 ms.
++			 */
++			if (!__atomic_exchange_n(&ws.wake, 0, __ATOMIC_ACQ_REL)) {
++				assert_wait_timeout((event_t)&ws.wake, THREAD_UNINT, busy ? 1 : pong_dark_idle() ? 40 : 10, 1000000u);
++				if (__atomic_load_n(&ws.wake, __ATOMIC_ACQUIRE)) {
++					thread_wakeup((event_t)&ws.wake);   /* set before the wait was armed: do not sleep the period out */
++				}
++				(void)thread_block(THREAD_CONTINUE_NULL);
++				__atomic_store_n(&ws.wake, 0, __ATOMIC_RELEASE);
+ 			}
+ 		}
+ 	}
+diff --git a/bsd/sys/pong_cpu_perf.h b/bsd/sys/pong_cpu_perf.h
+index db38334..e8b37d3 100644
+--- a/bsd/sys/pong_cpu_perf.h
++++ b/bsd/sys/pong_cpu_perf.h
+@@ -10,6 +10,7 @@ __BEGIN_DECLS
+ void pong_cpu_perf_init(void);
+ int pong_cpu_perf_status(char *out, size_t cap);
+ int pong_cpu_perf_set(const char *what, int value);
++void pong_cpu_perf_input(void);
+ 
+ __END_DECLS
+ 
