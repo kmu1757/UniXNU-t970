@@ -675,6 +675,15 @@ def t970_edits(gen, mhi, shared, out):
          '    lx_log(6, "wifi: security akm %u mfp %u (ap mfpc %u mfpr %u) h2e %u", C.rsn.akm, C.rsn.use_mfp, C.rsn.mfpc, C.rsn.mfpr, C.rsn.use_h2e);\n'
          '  } else if (rsn) { lx_log(4, "wifi: network needs a passphrase"); connect_done(NW_RES_BAD_KEY); return; }\n'),
     ])
+    # 18. Edit 17 keeps up to 768 bytes of a network's elements (IE_MAX), but the record handed out, struct nw_bss_info of
+    # include/nw_abi.h, still holds 384: a network with more overran the caller's stack by up to 384 bytes (11-17 half99m:
+    # pong_wifi_rejoin's nw_bss_info on the stack, a saved register overwritten, kernel data abort in fw_auto_thread; the
+    # scan results PongWifiNet hands to wifid take the same path). The module keeps all 768 for itself; callers get the
+    # first 384, as before edit 17.
+    edit(out / 'nw_sta_pong.c', [
+        ('    o->ie_len = b->ie_len; memcpy(o->ie, b->ie, b->ie_len); r = 0; }\n',
+         '    o->ie_len = b->ie_len < sizeof o->ie ? b->ie_len : (u16)sizeof o->ie; memcpy(o->ie, b->ie, o->ie_len); r = 0; }   /* edit 18 */\n'),
+    ])
     return qrtr
 
 
