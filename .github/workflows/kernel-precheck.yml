@@ -24,7 +24,7 @@ name: kernel-precheck
 # precheck of the same ref replaces an older one. It reads the package job's XNU
 # tree cache without writing it, and keeps a ccache of its own (ccache-precheck-*).
 #
-#   gh workflow run kernel-precheck.yml --repo kmu1757/UniXNU-y2q [--ref <branch>]
+#   gh workflow run kernel-precheck.yml --repo kmu1757/UniXNU-t970 [--ref <branch>]
 
 on:
   workflow_dispatch:
