@@ -1,0 +1,179 @@
+diff --git a/bsd/dev/pong_fts.c b/bsd/dev/pong_fts.c
+index 2d51484..6979550 100644
+--- a/bsd/dev/pong_fts.c
++++ b/bsd/dev/pong_fts.c
+@@ -124,6 +124,65 @@ static int pong_touch_fts = 0;
+ static int pong_touch_rot = 3; /* bit 0: Swap XY (1), bit 1: Invert X (2), bit 2: Invert Y (4) */
+ static int pong_touch_delay_sec = 20; /* Default 20s delay after boot before touch HW init */
+ static uint32_t i2c_delay_us = 4; /* Default ~100 kHz (4 us half-cycle) */
++/*
++ * z158 smooth-touch. A 16-byte event read at 4 us is some 19 bytes x 9 bits x 3 half-cycles, about 2.3 ms spun, and
++ * the loop slept 8 ms between INT checks: under 100 samples a second, bunched (the FTS reports at 120, DT
++ * sync-reportrate-120), at kernel priority on a Gold core next to backboardd.
++ *   pong_touch_i2c_us=N   half-cycle after init (1..45; 0 = as probed). Android drives this bus at 400 kHz (geni default).
++ *   pong_touch_poll_us=N  INT checked every N us while fingers moved in the last 100 ms (default 1000; 0 = 8 ms as before)
++ *   pong_touch_cluster=E  0 (default): the thread prefers the Silver cluster (its spin is bus-bound); -1: no binding
++ */
++static uint32_t touch_i2c_us = 0, touch_poll_us = 1000;
++static int touch_cluster = 0;
++extern void thread_soft_bind_cluster_type(thread_t thread, char cluster_type);
++
++/* USB `touch` (pong_fts_status()): since the last call, event reads and their bus time, coordinate events, and the
++ * time between one finger's move reports (what UIKit sees as the sample rate). One thread writes; a racing read is
++ * at worst off by one sample. */
++static uint32_t st_reads, st_events, st_gaps[5], st_gap_max_us;
++static uint64_t st_read_abs, st_since;
++
++static void
++touch_gap(uint64_t abs)
++{
++	static const uint32_t limit_us[4] = { 6000, 10000, 14000, 20000 };
++	uint64_t ns;
++	unsigned b = 0;
++
++	absolutetime_to_nanoseconds(abs, &ns);
++	uint32_t us = ns / NSEC_PER_USEC > UINT32_MAX ? UINT32_MAX : (uint32_t)(ns / NSEC_PER_USEC);
++	if (us >= 100000) {
++		return;                 /* (a pause, not a sample interval) */
++	}
++	while (b < 4 && us >= limit_us[b]) {
++		b++;
++	}
++	st_gaps[b]++;
++	st_gap_max_us = us > st_gap_max_us ? us : st_gap_max_us;
++}
++
++int pong_fts_status(char *out, size_t cap);
++int
++pong_fts_status(char *out, size_t cap)
++{
++	extern uint64_t mach_absolute_time(void);
++	uint64_t now = mach_absolute_time(), ms = 0, read_ns = 0;
++
++	if (st_since != 0) {
++		absolutetime_to_nanoseconds(now - st_since, &ms);
++		ms /= NSEC_PER_MSEC;
++	}
++	absolutetime_to_nanoseconds(st_read_abs, &read_ns);
++	int n = snprintf(out, cap, "touch: %llu ms: %u reads, %llu us each, %u events; move gaps <6 ms %u, <10 %u, <14 %u, <20 %u, "
++	    "longer %u (max %u us) | half-cycle %u us, poll %u us, cluster %d\n", ms, st_reads,
++	    st_reads ? read_ns / NSEC_PER_USEC / st_reads : 0, st_events, st_gaps[0], st_gaps[1], st_gaps[2], st_gaps[3],
++	    st_gaps[4], st_gap_max_us, i2c_delay_us, touch_poll_us, touch_cluster);
++	st_reads = st_events = st_gap_max_us = 0;
++	memset(st_gaps, 0, sizeof(st_gaps));
++	st_read_abs = 0;
++	st_since = now;
++	return n;
++}
+ 
+ static inline uint32_t
+ rd(vm_offset_t address)
+@@ -166,6 +225,15 @@ sleep_ms(uint32_t ms)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++static void
++nap_us(uint32_t us)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(us, NSEC_PER_USEC, &deadline);
++	assert_wait_deadline((event_t)&tlmm_vaddr, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
+ static void
+ pmsg_log(const char *fmt, ...)
+ {
+@@ -800,17 +868,33 @@ fts_touch_thread(__unused void *param, __unused wait_result_t wr)
+ 	}
+ 
+ 	uint32_t logged_touches = 0;
+-	unsigned idle_count = 0;
++	uint64_t last_read = mach_absolute_time(), last_touch = 0, catch_up, active;
++
++	if (touch_i2c_us >= 1 && touch_i2c_us <= 45) {
++		i2c_delay_us = touch_i2c_us;
++	}
++	if (touch_cluster == 0) {
++		thread_soft_bind_cluster_type(current_thread(), 'E');
++	}
++	pmsg_log("[PONG_FTS] run: half-cycle %u us, poll %u us while moving, cluster %d\n", i2c_delay_us, touch_poll_us,
++	    touch_cluster);
++	nanoseconds_to_absolutetime(80 * NSEC_PER_MSEC, &catch_up);
++	nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &active);
+ 
+ 	for (;;) {
+ 		/* dark idle (z134): every 100 ms, only when the controller raises INT (no 80 ms catch-up read) */
+ 		const bool dark = pong_dark_idle() != 0;
+ 		bool int_asserted = (rd(GPIO_IO(tlmm_vaddr, PIN_INT)) & 1) == 0;
+-		if (int_asserted || (!dark && ++idle_count >= 10)) {
+-			idle_count = 0;
++		uint64_t now = mach_absolute_time();
++		if (int_asserted || (!dark && now - last_read >= catch_up)) {
++			last_read = now;
+ 			for (int drain = 0; drain < 16; drain++) {
+ 				uint8_t ev[FTS_EVENT_SIZE];
+-				if (fts_read(FTS_READ_ONE_EVENT, ev, sizeof(ev)) != 0) {
++				uint64_t t0 = mach_absolute_time();
++				int failed = fts_read(FTS_READ_ONE_EVENT, ev, sizeof(ev));
++				st_read_abs += mach_absolute_time() - t0;
++				st_reads++;
++				if (failed != 0) {
+ 					break;
+ 				}
+ 				uint8_t id = ev[0] & 0x03;
+@@ -844,6 +928,11 @@ fts_touch_thread(__unused void *param, __unused wait_result_t wr)
+ 
+ 					pong_touch_post(action, tid, post_x, post_y);
+ 					pong_cpu_perf_input();     /* governor input boost (modes 3, 4) */
++					if (action == FTS_ACT_MOVE && last_touch != 0) {
++						touch_gap(mach_absolute_time() - last_touch);
++					}
++					st_events++;
++					last_touch = mach_absolute_time();
+ 
+ 					if (logged_touches < 4) {
+ 						logged_touches++;
+@@ -858,7 +947,13 @@ fts_touch_thread(__unused void *param, __unused wait_result_t wr)
+ 				}
+ 			}
+ 		}
+-		sleep_ms(dark ? 100 : 8);
++		if (dark) {
++			sleep_ms(100);
++		} else if (touch_poll_us != 0 && last_touch != 0 && mach_absolute_time() - last_touch < active) {
++			nap_us(touch_poll_us);  /* (a moving finger: read each report as INT rises, ~120 a second, evenly stamped) */
++		} else {
++			sleep_ms(8);
++		}
+ 	}
+ }
+ 
+@@ -880,6 +975,9 @@ pong_fts_init(void)
+ 	if (PE_parse_boot_argn("pong_touch_delay", &delay, sizeof(delay))) {
+ 		pong_touch_delay_sec = delay;
+ 	}
++	PE_parse_boot_argn("pong_touch_i2c_us", &touch_i2c_us, sizeof(touch_i2c_us));
++	PE_parse_boot_argn("pong_touch_poll_us", &touch_poll_us, sizeof(touch_poll_us));
++	PE_parse_boot_argn("pong_touch_cluster", &touch_cluster, sizeof(touch_cluster));
+ 	thread_t th = THREAD_NULL;
+ 	if (kernel_thread_start(fts_touch_thread, NULL, &th) == KERN_SUCCESS) {
+ 		thread_deallocate(th);
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 09c06ab..f290b03 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -2724,6 +2724,13 @@ dispatch_command(const char *cmd)
+ 		cmd_handle_usbhost(cmd + 7);
+ 	} else if (strcmp(cmd, "usbrole") == 0 || strncmp(cmd, "usbrole ", 8) == 0) {
+ 		cmd_handle_usbrole(cmd + 7);
++	} else if (strcmp(cmd, "touch") == 0) {
++		/* touch controller reads and move-report intervals since the last `touch` (bsd/dev/pong_fts.c, z158) */
++		extern int pong_fts_status(char *out, size_t cap);
++		char tc_reply[256];
++
++		(void)pong_fts_status(tc_reply, sizeof(tc_reply));
++		send_str(tc_reply);
+ 	} else if (strcmp(cmd, "dpu") == 0) {
+ 		/* the display controller, read only: clocks, CTL, mixers, pipes, INTF1/2 tear check, frames a second, flipping
+ 		 * (iokit/Kernel/MiniIOMobileFramebuffer.cpp, z109) */

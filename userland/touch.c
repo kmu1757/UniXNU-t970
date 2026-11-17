@@ -475,6 +475,8 @@ static void *
 input_thread(void *unused)
 {
     (void)unused;pthread_setname_np("Pong touch HID");
+    /* (z158: touches reach the event system ahead of the frame work they cause, as a real digitizer's do) */
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE,0);
     init_tp_rot();
     int device=-1;
     for (unsigned i=0;i<30 && device<0;i++) {
