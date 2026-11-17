@@ -1,0 +1,55 @@
+diff --git a/bsd/dev/pong_adsp.c b/bsd/dev/pong_adsp.c
+index 5ca8357..4078342 100644
+--- a/bsd/dev/pong_adsp.c
++++ b/bsd/dev/pong_adsp.c
+@@ -758,10 +758,12 @@ pong_adsp_boot_usb(char *reply, size_t cap, const char *args)
+ 			 * failed start (stage << 16 | error); the tone's periods= above stay 0 in device mode */
+ 			extern volatile uint32_t t970_audio_stream[16], t970_audio_bytes[12];
+ 
+-			AD_ADD(" dev=%u/%u/%u sent=%u/%u/%u slotpk=%u,%u,%u,%u late=%u lead=%u fail=%#x", t970_audio_stream[0],
++			/* slotpk is the largest since boot; runpk the largest of the current (or last) run, reset at each start: compare it
++			 * between two runs of one sound at two volume settings to see whether iOS scales the samples (software volume) */
++			AD_ADD(" dev=%u/%u/%u sent=%u/%u/%u slotpk=%u,%u,%u,%u runpk=%u late=%u lead=%u fail=%#x", t970_audio_stream[0],
+ 			    t970_audio_stream[1], t970_audio_stream[2], t970_audio_stream[3], t970_audio_stream[4], t970_audio_stream[5],
+-			    t970_audio_bytes[0], t970_audio_bytes[1], t970_audio_bytes[2], t970_audio_bytes[3], t970_audio_stream[6],
+-			    t970_audio_stream[10], t970_audio_stream[11]);
++			    t970_audio_bytes[0], t970_audio_bytes[1], t970_audio_bytes[2], t970_audio_bytes[3], t970_audio_stream[13],
++			    t970_audio_stream[6], t970_audio_stream[10], t970_audio_stream[11]);
+ 		}
+ 		AD_ADD(" dma=%#x/%#x amp", t970_audio_dma[0], t970_audio_dma[6]);
+ 		for (unsigned i = 0; i < 4; i++) {
+diff --git a/iokit/Kernel/T970IOAudio2.cpp b/iokit/Kernel/T970IOAudio2.cpp
+index c769435..35be471 100644
+--- a/iokit/Kernel/T970IOAudio2.cpp
++++ b/iokit/Kernel/T970IOAudio2.cpp
+@@ -55,6 +55,9 @@ struct Audio2Transition {
+ };
+ unsigned gMode;
+ bool gInput;                                           // pong_audio2_in=1
++// pong_audio2_vol=N (0..16): the amplifiers stay at volume step N whatever the engine sets (z156; 11-17 the engine set step 1,
++// -18 dB, at boot and never called the control again). 255 = not set: the engine's step, as before. Mute is still the engine's.
++unsigned gFixedVol = 255;
+ IOBufferMemoryDescriptor *gT970Control, *gT970Ring, *gT970InRing;   // retained for the boot (mode 2)
+ void audio2num(OSDictionary *d, const char *key, uint64_t value, unsigned bits = 32) {
+     auto n = OSNumber::withNumber(value, bits);
+@@ -411,7 +414,8 @@ void IOAudio2Device::clockLoop() {
+ void IOAudio2Device::applyVolume() {
+     T970AudioControl *c = t970Control();
+     if (!c) return;
+-    c->out_volume_mdb = muted || !volume ? T970_AUDIO_MUTE_MDB : int32_t((Audio2Db[volume] * 1000) / 4294967296LL);
++    const unsigned step = gFixedVol <= 16 ? gFixedVol : volume;
++    c->out_volume_mdb = muted || !step ? T970_AUDIO_MUTE_MDB : int32_t((Audio2Db[step] * 1000) / 4294967296LL);
+     __atomic_add_fetch(&c->out_volume_seq, 1u, __ATOMIC_ACQ_REL);
+ }
+ IOReturn IOAudio2Device::control(unsigned id, unsigned value, uint64_t *result) {
+@@ -506,6 +510,10 @@ extern "C" void t970_audio2_start(unsigned mode) {
+         uint32_t in = 0;
+         gInput = PE_parse_boot_argn("pong_audio2_in", &in, sizeof(in)) && in == 1;
+         t970_audio2[15] = gInput;
++        uint32_t v = 255;
++        if (PE_parse_boot_argn("pong_audio2_vol", &v, sizeof(v)) && v <= 16) {
++            gFixedVol = v;
++        }
+     }
+     if (mode == 1) {(void)audio2Publish(); return;}
+     thread_t t = nullptr;
