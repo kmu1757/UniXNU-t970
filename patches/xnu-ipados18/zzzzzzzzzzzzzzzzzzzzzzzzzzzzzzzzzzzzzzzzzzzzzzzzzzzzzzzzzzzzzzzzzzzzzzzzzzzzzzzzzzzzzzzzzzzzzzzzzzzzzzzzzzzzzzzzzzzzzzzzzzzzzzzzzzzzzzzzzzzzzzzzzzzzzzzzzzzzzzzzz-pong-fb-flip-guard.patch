@@ -1,0 +1,94 @@
+diff --git a/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+index a0b9af3..9b77629 100644
+--- a/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -427,6 +427,15 @@ static int              gPending = -1;          /* ... the one it has been told
+ static int              gNewest;                /* the last one a frame was drawn into */
+ static uint64_t         gPendingSince;          /* when the pipes were first told something they have not taken yet */
+ static uint32_t         gStatFlips, gStatReplaced;      /* flips told the pipes; of them, put in place of one not taken */
++/*
++ * The flips since boot, for USB `dpu` (z161): told, how many times a flip was found not taken although
++ * the panel had been sent frames since (stuck: flipping given up, the buffer on show drawn into), not
++ * taken while the panel was sent nothing (the display off, a long autorefresh count: waited, no failure),
++ * drawn over because no buffer was free (two buffers), panelLatched() timeouts; why flipping stopped.
++ */
++static uint32_t         gFlipTotal, gFlipStuck, gFlipWaited, gFlipNoFree, gLatchTimeouts;
++static uint32_t         gPendingFrame;          /* INTF1's frame count when the pending flip was told */
++static const char *     gFlipWhy = "";
+ static uint32_t         gStatPanelFrame;        /* INTF1's frame count at the last report */
+ /* the last five-second report of show(), for USB `dpu`: frames, ms, us each in the driver, flips, replaced, frames sent to the panel */
+ static uint32_t         gLastReport[6];
+@@ -760,12 +769,14 @@ panelFlip(unsigned which)
+ 	mdssWrite(MDSS_CTL(gCtl) + CTL_FLUSH, gPipeFlush);
+ 	after = mdssRead(MDSS_INTF1 + INTF_FRAME_COUNT);
+ 	gStatFlips++;
++	gFlipTotal++;
+ 	gStatReplaced += gPending >= 0 && waiting && after == before;
+ 	if (gPending < 0 || !waiting || after != before) {
+ 		if (gPending >= 0) {
+ 			gShown = gPending;
+ 		}
+ 		gPendingSince = mach_absolute_time();
++		gPendingFrame = after;
+ 	}
+ 	gPending = (int) which;
+ 	gNewest = (int) which;
+@@ -780,6 +791,7 @@ panelLatched(uint32_t ms)
+ 	clock_interval_to_deadline(ms, kMillisecondScale, &deadline);
+ 	while (mdssRead(MDSS_CTL(gCtl) + CTL_FLUSH) & gPipeFlush) {
+ 		if (mach_absolute_time() > deadline) {
++			gLatchTimeouts++;
+ 			return false;
+ 		}
+ 		IODelay(100);
+@@ -1313,6 +1325,10 @@ dpuReport(char * out, size_t cap)
+ 	DPU_SAY("flip: %s, %u buffers %llx %llx %llx, pipes %x ctl %d flush bits %x, scaled %d/%d, shown %d pending %d newest %d; "
+ 	    "%u flips, %u in place of one not taken\n", gFlipping ? "on" : "off", gPanelBuffers, gPanelPhys[0], gPanelPhys[1], gPanelPhys[2],
+ 	    gPipes, gCtl, gPipeFlush, gHwScale, gScaled, gShown, gPending, gNewest, gStatFlips, gStatReplaced);
++	DPU_SAY("flips since boot %u: stuck %u, waited (panel sent nothing) %u, drawn over (no free buffer) %u, latch timeouts %u; "
++	    "flush now %x, intf1 frames since the pending flip %u%s%s\n", gFlipTotal, gFlipStuck, gFlipWaited, gFlipNoFree, gLatchTimeouts,
++	    gCtl >= 0 ? mdssRead(MDSS_CTL(gCtl) + CTL_FLUSH) : 0, gPending >= 0 ? mdssRead(MDSS_INTF1 + INTF_FRAME_COUNT) - gPendingFrame : 0,
++	    gFlipWhy[0] ? "; stopped: " : "", gFlipWhy);
+ 	DPU_SAY("last 5 s report: %u frames in %u ms, %u us each in the driver; %u flips, %u replaced; the panel was sent %u frames\n",
+ 	    gLastReport[0], gLastReport[1], gLastReport[2], gLastReport[3], gLastReport[4], gLastReport[5]);
+ 	DPU_SAY("frame times: under 10 ms %u, 18 %u, 26 %u, 35 %u, longer %u (longest %u ms); half under %u ms, 95 in 100 under %u; "
+@@ -2085,12 +2101,33 @@ IOMobileFramebuffer::panelBackBuffer(const uint8_t * swap, MiniIOSurface ** surf
+ 	}
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - gPendingSince, &waited);
+ 	if (gPending >= 0 && waited >= PANEL_LATCH_MS * NSEC_PER_MSEC) {
+-		IOLog("MiniIOMobileFramebuffer: dpu: a flip was not taken in %u ms: one buffer from now on\n", PANEL_LATCH_MS);
+-		gFlipping = false;
+-		fBase = gPanelVirt[gPending];
+-		return -1;
+-	}
+-	for (back = 0; back == gShown || back == gPending; back++) {
++		/*
++		 * Not taken. A failure only if the panel was sent frames meanwhile (the flush is taken at a
++		 * transfer's start): then the pipes do not take what they are told, the buffer they show is
++		 * the one shown before, and that is where frames go from now on, one buffer. Sent nothing (the
++		 * display off, a long fb_ar_idle/fb_ar_off count): it is taken at the next transfer, nothing is
++		 * wrong. (Before z161: given up after 100 ms whatever the panel did, and the frames went into
++		 * the buffer not taken -- the hardware could take it later and show it for good, a frozen screen.)
++		 */
++		uint32_t sent = mdssRead(MDSS_INTF1 + INTF_FRAME_COUNT) - gPendingFrame;
++
++		if (sent >= 3) {
++			IOLog("MiniIOMobileFramebuffer: dpu: a flip to buffer %d was not taken in %llu ms although the panel was sent %u frames "
++			    "(ctl%d flush %#x, bits %#x): one buffer, the one on show (%d), from now on\n", gPending, waited / NSEC_PER_MSEC, sent, gCtl,
++			    mdssRead(MDSS_CTL(gCtl) + CTL_FLUSH), gPipeFlush, gShown);
++			gFlipStuck++;
++			gFlipWhy = "a flip not taken while the panel was sent frames";
++			gFlipping = false;
++			fBase = gPanelVirt[gShown];
++			return -1;
++		}
++		gFlipWaited++;
++	}
++	for (back = 0; back < (int) gPanelBuffers && (back == gShown || back == gPending); back++) {
++	}
++	if (back >= (int) gPanelBuffers) {
++		back = gPending;                /* (two buffers, the last flip not taken yet: this frame goes in its place) */
++		gFlipNoFree++;
+ 	}
+ 	fBase = gPanelVirt[back];
+ 	memcpy(src, swap + SWAP_SOURCE(0), sizeof(src));
