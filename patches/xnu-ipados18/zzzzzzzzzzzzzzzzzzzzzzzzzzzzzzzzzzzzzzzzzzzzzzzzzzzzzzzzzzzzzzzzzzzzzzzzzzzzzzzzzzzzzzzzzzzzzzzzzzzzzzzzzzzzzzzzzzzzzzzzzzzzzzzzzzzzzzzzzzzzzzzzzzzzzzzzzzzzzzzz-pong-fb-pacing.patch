@@ -1,0 +1,200 @@
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index f290b03..861f25b 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -2735,7 +2735,7 @@ dispatch_command(const char *cmd)
+ 		/* the display controller, read only: clocks, CTL, mixers, pipes, INTF1/2 tear check, frames a second, flipping
+ 		 * (iokit/Kernel/MiniIOMobileFramebuffer.cpp, z109) */
+ 		extern int pong_dpu_usb(char *reply, size_t cap);
+-		static char dp_reply[3600];
++		static char dp_reply[4096];
+ 
+ 		dp_reply[0] = '\0';
+ 		(void)pong_dpu_usb(dp_reply, sizeof(dp_reply));
+diff --git a/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+index 34adb43..a0b9af3 100644
+--- a/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -430,6 +430,10 @@ static uint32_t         gStatFlips, gStatReplaced;      /* flips told the pipes;
+ static uint32_t         gStatPanelFrame;        /* INTF1's frame count at the last report */
+ /* the last five-second report of show(), for USB `dpu`: frames, ms, us each in the driver, flips, replaced, frames sent to the panel */
+ static uint32_t         gLastReport[6];
++/* (z160) ... and how evenly: frames within 10/18/26/35 ms of the one before and longer, the longest, the ms half and 95 in
++ * 100 stayed under, pauses; then per frame us waiting for the GPU, frames that waited for the beat and their us, swaps
++ * held, lost, late; the ms the panel's frame count covers (it runs from report to report, not over the window). */
++static uint32_t         gFrameReport[16];
+ static bool             gHwScale;               /* frames are at the display's size and the pipes scale them to the panel */
+ static bool             gScaled;                /* ... and the pipes have been told so */
+ static bool             gFlipping;
+@@ -1024,6 +1028,97 @@ panelRateFrame(uint64_t now)
+ 	}
+ }
+ 
++/*
++ * fb_vsync_lock=1 (default 0, z160): the refresh notifications CoreAnimation paces itself by (armVSync) and fb_beat
++ * run at the panel's clock, not at exactly 1/refreshHz of ours. The panel's TE comes from its own oscillator; ours off
++ * from it by x makes one frame in every 1/(120 x) s go out twice or not at all -- a stutter every so many seconds of
++ * scrolling. Measured on INTF1's frame counter: while the TE rate (60/120) and the autorefresh count stay the same,
++ * frames x count / rate is the time our clock should have seen; segments of 1 s or more (closed every 10 s) are summed
++ * and the difference kept in millionths. Only the period changes, not the phase. USB `dpu`: the "vsync lock:" line.
++ */
++static TUNABLE(uint32_t, gVsyncLock, "fb_vsync_lock", 0);
++static uint64_t         gLockActual, gLockExpected; /* over the segments: our clock's time, the panel's frames' (abs) */
++static uint32_t         gLockSegments;
++static int32_t          gLockPpm;                   /* our period longer by so many millionths (the panel is slower) */
++
++static uint32_t
++panelTeHz(void)
++{
++	if (g120Hz == 3) {
++		return gRateFast ? 120 : 60;
++	}
++	return (g120Hz == 1 || g120Hz == 2) && g120Sent == 0 ? 120 : 60;
++}
++
++/* One look at INTF1's frame counter, from the refresh notification (about refreshHz a second, maybe more clients). */
++static void
++vsyncLockSample(void)
++{
++	static int busy;
++	static uint32_t f0, pf, hz0, n0;
++	static uint64_t t0, pt, onesec;
++	uint32_t power[6], f, n, hz;
++	uint64_t t;
++	bool same;
++
++	if (!gVsyncLock || __atomic_exchange_n(&busy, 1, __ATOMIC_ACQUIRE)) {
++		return;
++	}
++	if (!dpuMap() || !dpuPowered(power)) {
++		t0 = 0;
++		__atomic_store_n(&busy, 0, __ATOMIC_RELEASE);
++		return;
++	}
++	f = mdssRead(MDSS_INTF1 + INTF_FRAME_COUNT);
++	n = mdssRead(MDSS_INTF1 + INTF_TEAR_AUTOREFRESH);
++	n = (n & AUTOREFRESH_ON) ? n & 0xffff : 0;
++	hz = panelTeHz();
++	t = mach_absolute_time();
++	if (onesec == 0) {
++		nanoseconds_to_absolutetime(NSEC_PER_SEC, &onesec);
++	}
++	same = t0 != 0 && n == n0 && hz == hz0 && f >= pf;
++	if (same) {
++		pf = f;
++		pt = t;
++	}
++	if (!same || t - t0 >= 10 * onesec) {
++		/* the segment ends at the last sample of the same mode: counted when 1 s or longer */
++		if (t0 != 0 && n0 != 0 && hz0 != 0 && pt - t0 >= onesec && pf > f0) {
++			gLockActual += pt - t0;
++			gLockExpected += (uint64_t) (pf - f0) * n0 * onesec / hz0;
++			gLockSegments++;
++			if (gLockExpected > 600 * onesec) {
++				gLockActual /= 2;       /* (the last ten minutes or so count most) */
++				gLockExpected /= 2;
++			}
++			if (gLockExpected >= 2 * onesec) {
++				int64_t ppm = ((int64_t) gLockActual - (int64_t) gLockExpected) * 1000000 / (int64_t) gLockExpected;
++				/* (beyond 2 % it is not the clock but a mode taken for another) */
++				gLockPpm = ppm > 20000 || ppm < -20000 ? gLockPpm : (int32_t) ppm;
++			}
++		}
++		f0 = pf = f;
++		t0 = pt = t;
++		hz0 = hz;
++		n0 = n;
++	}
++	__atomic_store_n(&busy, 0, __ATOMIC_RELEASE);
++}
++
++/* One refresh at refreshHz, on the panel's clock with fb_vsync_lock. */
++static uint64_t
++vsyncPeriod(void)
++{
++	uint64_t period;
++
++	nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
++	if (gVsyncLock) {
++		period = (uint64_t) ((int64_t) period + (int64_t) period * gLockPpm / 1000000);
++	}
++	return period;
++}
++
+ /*
+  * The panel's controller set up as the boot-args ask: 120 Hz, autorefresh, then the pipes that show the
+  * framebuffer, the CTL path that has them, the scalers and the other buffers. Nothing is touched
+@@ -1220,6 +1315,15 @@ dpuReport(char * out, size_t cap)
+ 	    gPipes, gCtl, gPipeFlush, gHwScale, gScaled, gShown, gPending, gNewest, gStatFlips, gStatReplaced);
+ 	DPU_SAY("last 5 s report: %u frames in %u ms, %u us each in the driver; %u flips, %u replaced; the panel was sent %u frames\n",
+ 	    gLastReport[0], gLastReport[1], gLastReport[2], gLastReport[3], gLastReport[4], gLastReport[5]);
++	DPU_SAY("frame times: under 10 ms %u, 18 %u, 26 %u, 35 %u, longer %u (longest %u ms); half under %u ms, 95 in 100 under %u; "
++	    "%u pauses | GPU wait %u us a frame; %u waited %u us for the beat; %u held %u lost %u late | panel frames over %u ms\n",
++	    gFrameReport[0], gFrameReport[1], gFrameReport[2], gFrameReport[3], gFrameReport[4], gFrameReport[5], gFrameReport[6],
++	    gFrameReport[7], gFrameReport[8], gFrameReport[9], gFrameReport[10], gFrameReport[11], gFrameReport[12], gFrameReport[13],
++	    gFrameReport[14], gFrameReport[15]);
++	uint64_t lockNs;
++	absolutetime_to_nanoseconds(gLockExpected, &lockNs);
++	DPU_SAY("vsync lock: fb_vsync_lock %u, our period %+d ppm, from %u segments (%llu ms of frames), TE %u Hz now\n", gVsyncLock,
++	    gLockPpm, gLockSegments, lockNs / NSEC_PER_MSEC, panelTeHz());
+ 	DPU_SAY("ar idle: fb_ar_idle %u off %u after %u ms; count %u while frames come, %u now; %u down %u up\n", gArIdle, gArOff,
+ 	    gArIdleMs, gArActive, gArNow, gArDowns, gArUps);
+ 	DPU_SAY("120hz: fb_120hz %u, DCS 60 20 answer %d, intf1 sync_config_vsync %x -> %x now %x; adaptive: at %s, %u up %u down %u failed, "
+@@ -1836,6 +1940,13 @@ IOMobileFramebuffer::reportFrameTimes(void)
+ 		    "%u longer (the longest %u ms); half under %u ms, 95 in 100 under %u ms; %u pauses\n", within[0], within[1],
+ 		    within[2], within[3], within[4], fFrameLongest, half, most, fFramePauses);
+ 	}
++	for (uint32_t i = 0; i < 5; i++) {
++		gFrameReport[i] = within[i];
++	}
++	gFrameReport[5] = fFrameLongest;
++	gFrameReport[6] = half;
++	gFrameReport[7] = most;
++	gFrameReport[8] = fFramePauses;
+ 	bzero(fFrameTimes, sizeof(fFrameTimes));
+ 	fFramePauses = fFrameLongest = 0;
+ }
+@@ -2038,7 +2149,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+ 		/* (with buffers flipped the pipes take a frame at the panel's own beat: ours is not needed) */
+ 		uint64_t period, aim, next;
+ 
+-		nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
++		period = vsyncPeriod();
+ 		aim = period * 3 / 8;
+ 		next = fReady;
+ 		fReady = began;
+@@ -2204,6 +2315,12 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+ 		    fStatFrames * NSEC_PER_SEC / nanos, drawing / fStatFrames / NSEC_PER_USEC,
+ 		    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
+ 		    fStatHeld, fStatLost, fStatSwapsLate);
++		gFrameReport[9] = (uint32_t) (waiting / fStatFrames / NSEC_PER_USEC);
++		gFrameReport[10] = fStatOnBeat;
++		gFrameReport[11] = fStatOnBeat ? (uint32_t) (beat / fStatOnBeat / NSEC_PER_USEC) : 0;
++		gFrameReport[12] = fStatHeld;
++		gFrameReport[13] = fStatLost;
++		gFrameReport[14] = fStatSwapsLate;
+ 		fStatSwapsLate = 0;
+ 		gLastReport[0] = fStatFrames;
+ 		gLastReport[1] = (uint32_t) (nanos / NSEC_PER_MSEC);
+@@ -2214,6 +2331,11 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+ 			gLastReport[3] = gStatFlips;
+ 			gLastReport[4] = gStatReplaced;
+ 			gLastReport[5] = gStatPanelFrame != 0 ? panelFrame - gStatPanelFrame : 0;
++			static uint64_t panelAt;        /* (when gStatPanelFrame was read) */
++			uint64_t panelNs = 0;
++			absolutetime_to_nanoseconds(panelAt != 0 ? mach_absolute_time() - panelAt : 0, &panelNs);
++			gFrameReport[15] = (uint32_t) (panelNs / NSEC_PER_MSEC);
++			panelAt = mach_absolute_time();
+ 			IOLog("MiniIOMobileFramebuffer: dpu: %u flips, %u of them in place of one the panel had not taken; the panel was sent "
+ 			    "%u frames\n", gLastReport[3], gLastReport[4], gLastReport[5]);
+ 			gStatPanelFrame = panelFrame;
+@@ -2398,7 +2520,8 @@ IOMobileFramebufferUserClient::armVSync(void)
+ 	uint64_t period, now = mach_absolute_time();
+ 
+ 	/* one refresh after the last, not after whenever we got round to this: the rate does not drift */
+-	nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
++	vsyncLockSample();
++	period = vsyncPeriod();
+ 	fVSyncTime += period;
+ 	if (fVSyncTime <= now || fVSyncTime > now + 2 * period) {
+ 		fVSyncTime = now + period;
