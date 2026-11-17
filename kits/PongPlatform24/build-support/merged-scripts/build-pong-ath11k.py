@@ -341,6 +341,47 @@ def t970_edits(gen, mhi, shared, out):
          '      connect_done(NW_RES_TIMEOUT); }\n'
          '    if (C.state == NW_STA_UP || C.state >= NW_STA_AUTH) send_queued(); } }'),
     ])
+    # 16. (11-17) Station power save. The station never set any: the radio stayed awake for every beacon and frame while
+    #     connected, a fixed 100-300 mW estimated in work/gap_audit/POWER_ANALYSIS.md, mostly while the tablet is locked.
+    #     ath11k turns it on per vdev from vif->cfg.ps (ath11k_mac_op_bss_info_changed, BSS_CHANGED_PS ->
+    #     ath11k_mac_vif_setup_ps: WMI_STA_PS_PARAM_INACTIVITY_TIME = hw->conf.dynamic_ps_timeout, then
+    #     WMI_STA_PS_MODE_ENABLED; QCA6390 has supports_sta_ps). The firmware then sleeps between DTIM beacons and wakes for
+    #     the access point's TIM or for any frame we send (vdev create set TX_WAKE_THRESHOLD_ALWAYS, RX_WAKE_POLICY_WAKE),
+    #     going back to sleep after the inactivity time. Boot argument pong_wifi_ps: 0 never (the default until a device
+    #     measurement), 1 while the window server has the panel off (pong_panel_power_last() == 0, the lock screen; checked
+    #     every 100 ms by the connected step timer, so the screen coming on wakes the radio within 0.1 s), 2 always while
+    #     connected. pong_wifi_ps_ms is the inactivity time (default 100 ms, mac80211's own). A disconnect turns it off
+    #     first, so the next join starts awake. Each change is logged ("wifi: power save on/off"); wifistat's tx part shows
+    #     the state and the counts (scripts/build-t970-ath11k-link.py).
+    edit(out / 'nw_sta_pong.c', [
+        ("/* ---- the connection's life ---- */\nstatic void connect_done(int res) {\n",
+         "/* ---- station power save (build-pong-ath11k.py edit 16) ---- */\n"
+         'extern int pong_panel_power_last(void);   /* bsd/dev/pong_backlight_t970.c: -1 none seen yet, 0 off, 1 on */\n'
+         'unsigned nw_wifi_t970_ps_mode, nw_wifi_t970_ps_ms = 100;   /* boot arguments pong_wifi_ps, pong_wifi_ps_ms */\n'
+         'unsigned nw_wifi_t970_ps[3];   /* on now, times turned on, times turned off */\n'
+         'static void t970_ps_set(int on, const char *why) {\n'
+         '  if (!g_hw || !g_vif || !g_vif->cfg.ps == !on) return;\n'
+         '  g_vif->cfg.ps = on != 0; g_hw->conf.dynamic_ps_timeout = (int)nw_wifi_t970_ps_ms;\n'
+         '  g_ops->vif_cfg_changed(g_hw, g_vif, BSS_CHANGED_PS);\n'
+         '  nw_wifi_t970_ps[0] = on != 0; nw_wifi_t970_ps[on ? 1 : 2]++;\n'
+         '  lx_log(6, "wifi: power save %s (%s; inactivity %u ms; on %u off %u)", on ? "on" : "off", why, nw_wifi_t970_ps_ms,\n'
+         '         nw_wifi_t970_ps[1], nw_wifi_t970_ps[2]); }\n'
+         'static void t970_ps_step(void) {\n'
+         '  int dark = pong_panel_power_last() == 0;\n'
+         '  t970_ps_set(nw_wifi_t970_ps_mode >= 2 || (nw_wifi_t970_ps_mode == 1 && dark),\n'
+         '              nw_wifi_t970_ps_mode >= 2 ? "always" : dark ? "screen off" : "screen on"); }\n'
+         "/* ---- the connection's life ---- */\nstatic void connect_done(int res) {\n"),
+        ('  case NW_STA_UP: heartbeat(now); beacon_miss_check(now); break;\n',
+         '  case NW_STA_UP: heartbeat(now); beacon_miss_check(now); t970_ps_step(); break;\n'),
+        ('    if (g_vif->cfg.assoc) { g_vif->cfg.assoc = false;',
+         '    t970_ps_set(0, "disconnect");\n    if (g_vif->cfg.assoc) { g_vif->cfg.assoc = false;'),
+        ('  PE_parse_boot_argn("pong_wifi_dhcpb", &nw_wifi_t970_dhcpb, sizeof nw_wifi_t970_dhcpb);\n',
+         '  PE_parse_boot_argn("pong_wifi_dhcpb", &nw_wifi_t970_dhcpb, sizeof nw_wifi_t970_dhcpb);\n'
+         '  PE_parse_boot_argn("pong_wifi_ps", &nw_wifi_t970_ps_mode, sizeof nw_wifi_t970_ps_mode);\n'
+         '  PE_parse_boot_argn("pong_wifi_ps_ms", &nw_wifi_t970_ps_ms, sizeof nw_wifi_t970_ps_ms);\n'
+         '  if (!nw_wifi_t970_ps_ms || nw_wifi_t970_ps_ms > 10000) nw_wifi_t970_ps_ms = 100;\n'
+         '  lx_log(6, "wifi: power save mode %u (0 never, 1 screen off, 2 always), inactivity %u ms", nw_wifi_t970_ps_mode, nw_wifi_t970_ps_ms);\n'),
+    ])
     return qrtr
 
 
@@ -589,7 +630,7 @@ void ieee80211_queue_work(struct ieee80211_hw *hw, struct work_struct *work) { i
     objcopy = pong_paths.tool('llvm-objcopy', 'PONG_LLVM_OBJCOPY', ('/opt/local/bin/llvm-objcopy-mp-18',))
     undefined = subprocess.check_output([nm, '-u', '-j', str(linked)], text=True).splitlines()
     (out / 'undefined-symbols.txt').write_text('\n'.join(undefined) + '\n')
-    allowed = {'_PE_parse_boot_argn','_PongWifiRandom','_bzero','_memcmp','_memcpy','_memmove','_memset','_snprintf','_strchr','_strcmp','_strlen','_strncmp','_strncpy','_strtoul','_vsnprintf'}
+    allowed = {'_PE_parse_boot_argn','_PongWifiRandom','_pong_panel_power_last','_bzero','_memcmp','_memcpy','_memmove','_memset','_snprintf','_strchr','_strcmp','_strlen','_strncmp','_strncpy','_strtoul','_vsnprintf'}
     if set(undefined) - allowed: raise RuntimeError('unimplemented ath11k imports: ' + repr(set(undefined) - allowed))
     # Export only the documented board/station boundary. Linux shims have the
     # same C names as XNU helpers, so namespace every other defined symbol.
