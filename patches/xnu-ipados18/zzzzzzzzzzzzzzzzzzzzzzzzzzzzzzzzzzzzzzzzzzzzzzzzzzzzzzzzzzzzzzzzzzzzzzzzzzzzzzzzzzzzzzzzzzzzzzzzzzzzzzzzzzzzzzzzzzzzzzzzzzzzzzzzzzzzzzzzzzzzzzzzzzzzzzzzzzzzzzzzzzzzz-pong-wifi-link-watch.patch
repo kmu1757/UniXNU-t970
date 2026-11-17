@@ -1,0 +1,109 @@
+diff --git a/bsd/dev/pong_wifi_link.c b/bsd/dev/pong_wifi_link.c
+index 50b4da3..db16eb0 100644
+--- a/bsd/dev/pong_wifi_link.c
++++ b/bsd/dev/pong_wifi_link.c
+@@ -3926,30 +3926,37 @@ void pong_wifi_stack_table(uint64_t table_pa);
+  * wire): GDSC and clocks running, PARF LTSSM enable, DBI link up, data link layer active. Any LTSSM state of a
+  * trained link passes (L1 wakes up for the request). The first refusals go to pmsg with what was seen.
+  */
++static bool
++wl_link_ok(uint32_t r[6])       /* gdsc, halt, ltssm, dbg0, dbg1, lnk as seen */
++{
++	r[0] = r[1] = r[2] = r[3] = r[4] = r[5] = 0;
++	if (!wl_is_up || !((r[0] = rd(GCC_PCIE0_GDSCR)) & (1u << 31)) || ((r[1] = wl_halt()) & (WL_HALT_PARF | WL_HALT_DBI))) {
++		return false;
++	}
++	r[2] = rd(PARF_LTSSM);
++	r[3] = rd(DBI_DEBUG0);
++	r[4] = rd(DBI_DEBUG1);
++	r[5] = rd(DBI_LNKCTL);
++	return (r[2] & (1u << 8)) && (r[4] & (1u << 4)) && (r[5] & (1u << 29));
++}
++
+ volatile void *
+ pong_wifi_ep_cfg(unsigned int off)
+ {
+ 	static unsigned refused;
+-	uint32_t gdsc = 0, halt = 0, ltssm = 0, dbg0 = 0, dbg1 = 0, lnk = 0;
++	uint32_t r[6];
+ 
+ 	if (off >= 4096u) {
+ 		return NULL;
+ 	}
+-	if (wl_is_up && ((gdsc = rd(GCC_PCIE0_GDSCR)) & (1u << 31)) &&
+-	    !((halt = wl_halt()) & (WL_HALT_PARF | WL_HALT_DBI))) {
+-		ltssm = rd(PARF_LTSSM);
+-		dbg0 = rd(DBI_DEBUG0);
+-		dbg1 = rd(DBI_DEBUG1);
+-		lnk = rd(DBI_LNKCTL);
+-		if ((ltssm & (1u << 8)) && (dbg1 & (1u << 4)) && (lnk & (1u << 29))) {
+-			return (volatile void *)wl_ptr(CFGSPACE + off);
+-		}
++	if (wl_link_ok(r)) {
++		return (volatile void *)wl_ptr(CFGSPACE + off);
+ 	}
+ 	if (refused++ < 4) {
+ 		char line[160];
+ 		int n = snprintf(line, sizeof(line),
+ 		    "[PONG_WIFI] epcfg nolink nolink off %x up %d gdsc %x halt %x ltssm %x dbg0 %x dbg1 %x lnk %x\n",
+-		    off, wl_is_up, gdsc, halt, ltssm, dbg0, dbg1, lnk);
++		    off, wl_is_up, r[0], r[1], r[2], r[3], r[4], r[5]);
+ 
+ 		if (n > 0) {
+ 			pong_ramoops_diagnostic_write(line, n < (int)sizeof(line) ? n : (int)sizeof(line) - 1);
+@@ -3958,6 +3965,24 @@ pong_wifi_ep_cfg(unsigned int off)
+ 	return NULL;
+ }
+ 
++/* For the ath11k worker before each step (it touches BAR0 then): 1 while the link is up, else 0 with the registers seen
++ * written into `why`. The same root-port reads as pong_wifi_ep_cfg(), none of them a request on the wire. */
++int pong_wifi_link_ok(char *why, size_t cap);
++int
++pong_wifi_link_ok(char *why, size_t cap)
++{
++	uint32_t r[6];
++
++	if (wl_link_ok(r)) {
++		return 1;
++	}
++	if (why && cap) {
++		(void)snprintf(why, cap, "linklost linklost up %d gdsc %x halt %x ltssm %x dbg0 %x dbg1 %x lnk %x",
++		    wl_is_up, r[0], r[1], r[2], r[3], r[4], r[5]);
++	}
++	return 0;
++}
++
+ /* The table `wifis3b bank` loads into TTBR0 instead of the test arena's; set before the bank is programmed. */
+ void
+ pong_wifi_stack_table(uint64_t table_pa)
+diff --git a/bsd/dev/pong_wifi_stack.c b/bsd/dev/pong_wifi_stack.c
+index 3e32896..6b45573 100644
+--- a/bsd/dev/pong_wifi_stack.c
++++ b/bsd/dev/pong_wifi_stack.c
+@@ -53,6 +53,7 @@ extern int pong_wifi_link_up(char *reply, size_t reply_len);
+ extern int pong_wifi_mhi_read(char *reply, size_t reply_len);
+ extern int pong_wifi_stage3b(char *reply, size_t reply_len, int what);
+ extern volatile void *pong_wifi_ep_cfg(unsigned int off);
++extern int pong_wifi_link_ok(char *why, size_t cap);
+ extern void pong_wifi_stack_table(uint64_t table_pa);
+ 
+ int pong_wifi_stack_usb(char *reply, size_t reply_cap, int what);
+@@ -675,6 +676,18 @@ ws_run(void)
+ 	ws_log(6, "w9b w9b started");
+ 	ws.stage = 10;
+ 	for (;;) {
++		/*
++		 * The step touches BAR0; with the link or its power gone that read is never answered and stalls the bus: a
++		 * whole-tablet hang without panic (11-17 half98m, during ARP traffic after joining). Checked first on the root
++		 * port's own registers; on a loss the worker logs what it saw and parks, the tablet keeps running.
++		 */
++		if (!pong_wifi_link_ok(ws.stage_line, sizeof(ws.stage_line))) {
++			ws.stage = -12;
++			ws_log(3, ws.stage_line);
++			for (;;) {
++				delay_for_interval(1000, 1000000u);
++			}
++		}
+ 		const int busy = nw_wifi_step();
+ 
+ 		ws.steps++;
