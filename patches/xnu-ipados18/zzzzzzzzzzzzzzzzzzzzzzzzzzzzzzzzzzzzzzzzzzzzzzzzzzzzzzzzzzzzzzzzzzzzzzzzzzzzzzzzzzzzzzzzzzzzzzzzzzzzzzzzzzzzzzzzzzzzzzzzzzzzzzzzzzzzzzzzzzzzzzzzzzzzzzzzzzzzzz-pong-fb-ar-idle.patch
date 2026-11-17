@@ -1,0 +1,145 @@
+diff --git a/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+index 0682a1e..34adb43 100644
+--- a/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -803,6 +803,102 @@ panelAutorefresh(void)
+ 	IOLog("MiniIOMobileFramebuffer: dpu: intf1 autorefresh %#x now (was %#x)\n", mdssRead(MDSS_INTF1 + INTF_TEAR_AUTOREFRESH), config);
+ }
+ 
++/*
++ * Boot-arg fb_ar_idle=N (0, the default: off): while nothing moves, INTF1 sends the panel a frame on
++ * every N-th TE pulse only (a command-mode panel keeps showing what it has; DSI, DSC and the panel's
++ * input are busy only for what is sent). A still screen still gets a frame some every 50 ms (11-17):
++ * those go out at the idle count, at most N TE pulses late. Moving -- two frame intervals in a row under
++ * fb_ar_active_us (30000), as fb_120hz=3 tells it -- puts back the count it had (every TE with
++ * fb_autorefresh=1 or fb_120hz) until fb_ar_idle_ms (1000) after the last moving frame. fb_ar_off=M: M
++ * instead of N while the display is off (z104's DCS 0x28, pong_panel_is_off()); 0: N. Only the frame
++ * count is changed, as fb_autorefresh does it (the work/gap_audit/POWER_ANALYSIS.md request, 11-17).
++ */
++static TUNABLE(uint32_t, gArIdle, "fb_ar_idle", 0);
++static TUNABLE(uint32_t, gArOff, "fb_ar_off", 0);
++static TUNABLE(uint32_t, gArIdleMs, "fb_ar_idle_ms", 1000);
++static TUNABLE(uint32_t, gArActiveUs, "fb_ar_active_us", 30000);
++static IOLock *         gArLock;
++static thread_call_t    gArCall;
++static uint32_t         gArActive, gArNow;      /* the count while frames come; the count now */
++static uint32_t         gArDowns, gArUps, gArShort;
++static uint64_t         gArLast;
++
++/* INTF1's autorefresh count to `count` (it stays on). With gArLock held. */
++static void
++panelArSet(uint32_t count)
++{
++	uint32_t config;
++
++	if (count == 0 || count > 0xffff || count == gArNow || !panelAlive("autorefresh")) {
++		return;
++	}
++	config = mdssRead(MDSS_INTF1 + INTF_TEAR_AUTOREFRESH);
++	if (!(config & AUTOREFRESH_ON)) {
++		return;
++	}
++	mdssWrite(MDSS_INTF1 + INTF_TEAR_AUTOREFRESH, AUTOREFRESH_ON | count);
++	gArNow = count;
++}
++
++/* No frame for fb_ar_idle_ms: the idle count (or the display-off one); looked at again while idle, for the display going off. */
++static void
++panelArIdle(thread_call_param_t, thread_call_param_t)
++{
++	uint64_t deadline;
++	uint32_t want = pong_panel_is_off() && gArOff != 0 ? gArOff : gArIdle;
++
++	IOLockLock(gArLock);
++	if (gArNow != want) {
++		panelArSet(want);
++		gArDowns++;
++	}
++	IOLockUnlock(gArLock);
++	clock_interval_to_deadline(gArIdleMs, kMillisecondScale, &deadline);
++	thread_call_enter_delayed(gArCall, deadline);
++}
++
++static void
++panelArInit(void)
++{
++	gArActive = gArNow = mdssRead(MDSS_INTF1 + INTF_TEAR_AUTOREFRESH) & 0xffff;
++	gArLock = IOLockAlloc();
++	gArCall = thread_call_allocate(panelArIdle, NULL);
++	if (gArLock == NULL || gArCall == NULL || gArActive == 0) {
++		gArCall = NULL;
++		return;
++	}
++	IOLog("MiniIOMobileFramebuffer: dpu: fb_ar_idle=%u: autorefresh %u while frames come, %u after %u ms without one (%u display off)\n",
++	    gArIdle, gArActive, gArIdle, gArIdleMs, gArOff ? gArOff : gArIdle);
++	panelArIdle(NULL, NULL);
++}
++
++/* A frame drawn at `now` is about to go to the panel: if things move, every TE again, idle fb_ar_idle_ms after the last such frame. */
++static void
++panelArFrame(uint64_t now)
++{
++	uint64_t us, deadline;
++	bool moving;
++
++	if (gArCall == NULL) {
++		return;
++	}
++	IOLockLock(gArLock);
++	us = gArLast != 0 ? micros(now) - micros(gArLast) : 0;
++	gArLast = now;
++	gArShort = us != 0 && us < gArActiveUs ? gArShort + 1 : 0;
++	/* (and the first frame after the display-off count: a flip must be taken within PANEL_LATCH_MS) */
++	moving = gArShort >= 2 || (gArNow != gArActive && gArNow != gArIdle);
++	if (moving && gArNow != gArActive) {
++		panelArSet(gArActive);
++		gArUps++;
++	}
++	IOLockUnlock(gArLock);
++	if (moving) {
++		clock_interval_to_deadline(gArIdleMs, kMillisecondScale, &deadline);
++		thread_call_enter_delayed(gArCall, deadline);
++	}
++}
++
+ /*
+  * INTF1's line counter for 120 Hz: half the UEFI's 60 Hz count, lines and flags kept (the device, 11-16: 0x1800b6,
+  * 182 vsync clocks a line, so the UEFI counts some 1758 lines a frame, not the stock mode's 1912 -- 91, not 83).
+@@ -939,7 +1035,7 @@ panelInit(uint32_t rowBytes, uint32_t width, uint32_t height, uint32_t displayWi
+ 	uint64_t frontSize = (uint64_t) rowBytes * height, size, next;
+ 	unsigned want;
+ 
+-	if (gFlip == 0 && gAutorefresh == 0 && g120Hz == 0) {
++	if (gFlip == 0 && gAutorefresh == 0 && g120Hz == 0 && gArIdle == 0) {
+ 		return;
+ 	}
+ 	if ((uint64_t) vinfo.v_physaddr != PANEL_FRONT_PHYS || PANEL_FRONT_PHYS + frontSize > PANEL_RESERVED_END) {
+@@ -957,6 +1053,9 @@ panelInit(uint32_t rowBytes, uint32_t width, uint32_t height, uint32_t displayWi
+ 		panelRateInit();                /* (60 Hz until frames come faster: panelRateFrame()) */
+ 	}
+ 	panelAutorefresh();
++	if (gArIdle != 0) {
++		panelArInit();                  /* (after the count fb_autorefresh / fb_120hz asked for: that is the one frames get) */
++	}
+ 	if (gFlip == 0) {
+ 		return;
+ 	}
+@@ -1121,6 +1220,8 @@ dpuReport(char * out, size_t cap)
+ 	    gPipes, gCtl, gPipeFlush, gHwScale, gScaled, gShown, gPending, gNewest, gStatFlips, gStatReplaced);
+ 	DPU_SAY("last 5 s report: %u frames in %u ms, %u us each in the driver; %u flips, %u replaced; the panel was sent %u frames\n",
+ 	    gLastReport[0], gLastReport[1], gLastReport[2], gLastReport[3], gLastReport[4], gLastReport[5]);
++	DPU_SAY("ar idle: fb_ar_idle %u off %u after %u ms; count %u while frames come, %u now; %u down %u up\n", gArIdle, gArOff,
++	    gArIdleMs, gArActive, gArNow, gArDowns, gArUps);
+ 	DPU_SAY("120hz: fb_120hz %u, DCS 60 20 answer %d, intf1 sync_config_vsync %x -> %x now %x; adaptive: at %s, %u up %u down %u failed, "
+ 	    "frames every %llu us\n", g120Hz, g120Sent, g120Sync[0], g120Sync[1], mdssRead(MDSS_INTF1 + INTF_TEAR_SYNC_CONFIG_VSYNC),
+ 	    gRateFast ? "120" : "60", gRateUp, gRateDown, gRateFailed, gRateAvgUs);
+@@ -2061,6 +2162,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+ 			}
+ 		}
+ 	}
++	if (drew && gArIdle != 0) {
++		panelArFrame(began);            /* (fb_ar_idle: every TE again, when things move, before the frame is flipped to or sent) */
++	}
+ 	if (drew && back >= 0) {
+ 		panelFlip((unsigned) back);     /* (on show from the next frame's start) */
+ 	}
