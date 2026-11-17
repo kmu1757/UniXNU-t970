@@ -127,6 +127,11 @@ NET_EDITS = (
     # auto-join (11-14): POWER_CHANGED once en0 is up
     ('  publish_registry("en0");\n',
      '  publish_registry("en0");\n  lck_mtx_lock(gLock); notify_locked(NotifyPower); lck_mtx_unlock(gLock);   // the daemon learns the interface is powered\n'),
+    # WPA3-Personal (SAE), PSK-SHA256, and PMF (802.11w) capabilities for 22H374 IO80211
+    ('if(a.auth_upper && a.auth_upper!=8) {memset(&a,0,sizeof(a));return EOPNOTSUPP;}',
+     'if(a.auth_upper && (a.auth_upper & ~(0x8u | 0x400u | 0x1000u))) {memset(&a,0,sizeof(a));return EOPNOTSUPP;}'),
+    ('static const uint8_t has[] = { 2, 3, 6, 9, 10, 14, 17, 19 };',
+     'static const uint8_t has[] = { 2, 3, 6, 9, 10, 14, 17, 19, 52, 75, 76 };'),
 )
 NET_TAIL = ('\nextern "C" void pong_wifi_net_traffic(void);\n'
             'extern "C" void pong_wifi_net_traffic(void) {\n'

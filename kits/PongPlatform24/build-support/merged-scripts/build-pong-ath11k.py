@@ -382,6 +382,299 @@ def t970_edits(gen, mhi, shared, out):
          '  if (!nw_wifi_t970_ps_ms || nw_wifi_t970_ps_ms > 10000) nw_wifi_t970_ps_ms = 100;\n'
          '  lx_log(6, "wifi: power save mode %u (0 never, 1 screen off, 2 always), inactivity %u ms", nw_wifi_t970_ps_mode, nw_wifi_t970_ps_ms);\n'),
     ])
+    # 17. WPA3-Personal (SAE Group 19 H&P + H2E), WPA2/WPA3 mixed mode, PSK-SHA256, and PMF (802.11w / BIP-CMAC-128)
+    edit(out / 'nw_sta_pong.c', [
+        ('#include "nw_sta.h"\n',
+         '#include "nw_sta.h"\n#include "T970WifiWpa3.h"   /* edit 17 */\n'),
+        ('#define IE_MAX 384\n',
+         '#define IE_MAX 768   /* edit 17: retain trailing RSNXE on large beacons */\n'),
+        ('  struct ieee80211_key_conf *ptk_key, *gtk_key; u16 seq; u8 gtk_id;\n'
+         '  u64 started; u64 last_tx; int tries; int rsn_ok; u16 aid;\n'
+         '  /* message 4 waits for its acknowledgement before the keys go in: the access point may repeat message 3 in the clear meanwhile */\n'
+         '  u8 gtk[32]; int gtk_len, gtk_idx; int m4_done; u64 m4_at; u64 hb_at; unsigned hb_frames, hb_beacons, hb_quiet; u64 bmiss_at; unsigned bmiss_frames;\n'
+         '} C;\n',
+         '  struct ieee80211_key_conf *ptk_key, *gtk_key, *igtk_key; u16 seq; u8 gtk_id;\n'
+         '  u64 started; u64 last_tx; int tries; int rsn_ok; u16 aid;\n'
+         '  /* message 4 waits for its acknowledgement before the keys go in: the access point may repeat message 3 in the clear meanwhile */\n'
+         '  u8 gtk[32]; int gtk_len, gtk_idx; int m4_done; u64 m4_at; u64 hb_at; unsigned hb_frames, hb_beacons, hb_quiet; u64 bmiss_at; unsigned bmiss_frames;\n'
+         '  pw3_rsn_info rsn; pw3_sae_ctx sae; u8 pass[65]; int pass_len; u8 pmkid[16]; u8 have_pmkid;\n'
+         '  u8 sae_stage, sae_token[64], sae_token_len; u8 igtk[16], igtk_pn[6]; u16 igtk_id; u8 have_igtk;\n'
+         '} C;\n'),
+        ('static int rsn_check(const u8 *e) {\n'
+         '  if (!e) return -1;\n'
+         '  const u8 *p = e + 2, *end = e + 2 + e[1]; if (end - p < 2) return -1; p += 2;                         /* version */\n'
+         '  if (end - p < 4) return -1; p += 4;                                                                /* group cipher: any is accepted for receive */\n'
+         '  if (end - p < 2) return -1; unsigned n = p[0] | p[1] << 8; p += 2; int ccmp = 0;\n'
+         '  for (unsigned i = 0; i < n; i++) { if (end - p < 4) return -1; if (!memcmp(p, OUI_RSN, 3) && p[3] == 4) ccmp = 1; p += 4; }\n'
+         '  if (end - p < 2) return -1; n = p[0] | p[1] << 8; p += 2; int psk = 0;\n'
+         '  for (unsigned i = 0; i < n; i++) { if (end - p < 4) return -1; if (!memcmp(p, OUI_RSN, 3) && p[3] == 2) psk = 1; p += 4; }\n'
+         '  u16 caps = end - p >= 2 ? (u16)(p[0] | p[1] << 8) : 0;\n'
+         '  if (!ccmp || !psk) return -2;\n'
+         '  if (caps & 0x0040) return -2;                                                                      /* management frame protection required */\n'
+         '  return 0; }\n',
+         'static int rsn_check(const u8 *e) {\n'
+         '  if (!e) return -1;\n'
+         '  return pw3_parse_rsn_ap(C.ap.ie, C.ap.ie_len, &C.rsn); }\n'),
+        ('static void send_auth(void) {\n'
+         '  struct sk_buff *skb = new_frame(8); if (!skb) return;\n'
+         '  mgmt_header(skb, IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_AUTH);\n'
+         '  u8 *b = skb_put_zero(skb, 6); b[0] = 0; b[1] = 0; b[2] = 1; b[3] = 0; b[4] = 0; b[5] = 0;      /* open system, sequence 1, status 0 */\n'
+         '  tx_frame(skb); }\n',
+         'static void make_nonce(u8 *out);\n'
+         'static void send_sae_commit(void) {\n'
+         '  struct sk_buff *skb = new_frame(200); if (!skb) return;\n'
+         '  mgmt_header(skb, IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_AUTH);\n'
+         '  u8 *b = skb_put(skb, 180);\n'
+         '  size_t blen = pw3_build_sae_commit(&C.sae, C.sae_token, C.sae_token_len, b, 180);\n'
+         '  if (!blen) { lx_free(skb); return; }\n'
+         '  skb->len -= (unsigned)(180u - blen);\n'
+         '  tx_frame(skb); }\n'
+         'static void send_sae_confirm(void) {\n'
+         '  struct sk_buff *skb = new_frame(64); if (!skb) return;\n'
+         '  mgmt_header(skb, IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_AUTH);\n'
+         '  u8 *b = skb_put(skb, 40);\n'
+         '  size_t blen = pw3_build_sae_confirm(&C.sae, b, 40);\n'
+         '  if (!blen) { lx_free(skb); return; }\n'
+         '  tx_frame(skb); }\n'
+         'static int start_sae(int h2e) {\n'
+         '  int rc = h2e ? pw3_sae_derive_pwe_h2e(&C.sae, C.ssid, C.ssid_len, g_vif->addr, C.ap.bssid, C.pass, (size_t)C.pass_len)\n'
+         '               : pw3_sae_derive_pwe_hnp(&C.sae, g_vif->addr, C.ap.bssid, C.pass, (size_t)C.pass_len);\n'
+         '  if (rc) { lx_log(3, "wifi: SAE PWE derivation failed (%s)", h2e ? "H2E" : "H&P"); connect_done(NW_RES_FAILED); return -1; }\n'
+         '  u8 rnd[64]; int ok = -1;\n'
+         '  for (int i = 0; i < 8 && ok != 0; i++) { make_nonce(rnd); make_nonce(rnd + 32); ok = pw3_sae_commit_begin(&C.sae, rnd); }\n'
+         '  pw3_ct_zero(rnd, sizeof rnd);\n'
+         '  if (ok) { connect_done(NW_RES_FAILED); return -1; }\n'
+         '  C.sae_stage = 1; C.sae_token_len = 0;\n'
+         '  lx_log(6, "wifi: SAE commit (%s)", h2e ? "H2E" : "H&P");\n'
+         '  send_sae_commit(); return 0; }\n'
+         'static void send_auth(void) {\n'
+         '  if (C.secure && C.rsn.akm == 8u) {\n'
+         '    if (C.sae_stage == 0u) start_sae(C.rsn.use_h2e);\n'
+         '    else if (C.sae_stage == 1u) send_sae_commit();\n'
+         '    else if (C.sae_stage == 2u) send_sae_confirm();\n'
+         '    return; }\n'
+         '  struct sk_buff *skb = new_frame(8); if (!skb) return;\n'
+         '  mgmt_header(skb, IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_AUTH);\n'
+         '  u8 *b = skb_put_zero(skb, 6); b[0] = 0; b[1] = 0; b[2] = 1; b[3] = 0; b[4] = 0; b[5] = 0;\n'
+         '  tx_frame(skb); }\n'),
+        ('  if (C.secure) {   /* RSN: version 1, group CCMP, pairwise CCMP, key management PSK, no capabilities */\n'
+         '    static const u8 rsn[] = { WLAN_EID_RSN, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 2, 0, 0 };\n'
+         '    skb_put_data(skb, rsn, sizeof rsn); }\n',
+         '  if (C.secure) {\n'
+         '    u8 ie[80]; size_t rlen = pw3_build_assoc_rsn(&C.rsn, C.have_pmkid ? C.pmkid : 0, ie, sizeof ie);\n'
+         '    if (rlen) skb_put_data(skb, ie, rlen);\n'
+         '    size_t xlen = pw3_build_assoc_rsnxe(&C.rsn, ie, sizeof ie);\n'
+         '    if (xlen) skb_put_data(skb, ie, xlen); }\n'),
+        ('  sta->wme = true;\n',
+         '  sta->wme = true; sta->mfp = (C.secure && C.rsn.use_mfp) ? true : false;\n'),
+        ('static void derive_ptk(void) {\n'
+         '  u8 data[76]; const u8 *a = g_vif->addr, *b = C.ap.bssid;\n'
+         '  const u8 *lo = memcmp(a, b, 6) < 0 ? a : b, *hi = lo == a ? b : a; memcpy(data, lo, 6); memcpy(data + 6, hi, 6);\n'
+         '  const u8 *nl = memcmp(C.anonce, C.snonce, 32) < 0 ? C.anonce : C.snonce, *nh = nl == C.anonce ? C.snonce : C.anonce; memcpy(data + 12, nl, 32); memcpy(data + 44, nh, 32);\n'
+         '  nw_prf(C.pmk, 32, "Pairwise key expansion", data, 76, C.ptk, 384); C.ptk_ready = 1; }\n',
+         'static u8 eapol_out_ver(void) { return C.rsn.akm == 8u ? 0u : (C.rsn.akm == 6u ? 3u : 2u); }\n'
+         'static int eapol_ver_ok(u8 v) {\n'
+         '  if (C.rsn.akm == 8u) return v == 0u || v == 3u;\n'
+         '  if (C.rsn.akm == 6u) return v == 3u;\n'
+         '  return v == 2u; }\n'
+         'static void eapol_mic(const u8 *buf, unsigned total, u8 out[16]) {\n'
+         '  if (C.rsn.akm >= 6u) { pw3_aes128_cmac(C.ptk, buf, total, out); }\n'
+         '  else { u8 h[20]; nw_hmac_sha1(C.ptk, 16, buf, total, h); memcpy(out, h, 16); } }\n'
+         'static void derive_ptk(void) {\n'
+         '  u8 data[76]; const u8 *a = g_vif->addr, *b = C.ap.bssid;\n'
+         '  if (C.rsn.akm >= 6u) { pw3_derive_ptk_sha256(C.pmk, b, a, C.anonce, C.snonce, C.ptk); C.ptk_ready = 1; return; }\n'
+         '  const u8 *lo = memcmp(a, b, 6) < 0 ? a : b, *hi = lo == a ? b : a; memcpy(data, lo, 6); memcpy(data + 6, hi, 6);\n'
+         '  const u8 *nl = memcmp(C.anonce, C.snonce, 32) < 0 ? C.anonce : C.snonce, *nh = nl == C.anonce ? C.snonce : C.anonce; memcpy(data + 12, nl, 32); memcpy(data + 44, nh, 32);\n'
+         '  nw_prf(C.pmk, 32, "Pairwise key expansion", data, 76, C.ptk, 384); C.ptk_ready = 1; }\n'),
+        ('static void sign(struct eapol_key *k, unsigned total) {\n'
+         '  u8 h[20]; memset(k->mic, 0, 16); nw_hmac_sha1(C.ptk, 16, (const u8 *)k, total, h); memcpy(k->mic, h, 16); }\n',
+         'static void sign(struct eapol_key *k, unsigned total) {\n'
+         '  memset(k->mic, 0, 16); eapol_mic((const u8 *)k, total, k->mic); }\n'),
+        ('  int r = g_ops->set_key(g_hw, SET_KEY, g_vif, pairwise ? C.sta : 0, kc);\n'
+         '  if (r) { lx_log(3, "wifi: installing the %s key failed: %d", pairwise ? "pairwise" : "group", r); lx_free(kc); return r; }\n',
+         '  int r = g_ops->set_key(g_hw, SET_KEY, g_vif, pairwise ? C.sta : 0, kc);\n'
+         '  if (r < 0) { lx_log(3, "wifi: installing the %s key failed: %d", pairwise ? "pairwise" : "group", r); lx_free(kc); return r; }\n'),
+        ('static void install_keys(void) {\n'
+         '  if (install_key(1, 0, C.ptk + 32, 16)) { connect_done(NW_RES_FAILED); return; }\n'
+         '  if (C.gtk_len && install_key(0, C.gtk_idx, C.gtk, 16)) { connect_done(NW_RES_FAILED); return; }\n'
+         '  C.hs_stage = 4; finish_authorized(); }\n',
+         'static int install_igtk(void) {\n'
+         '  if (!C.have_igtk) return 0;\n'
+         '  if (C.igtk_key) { g_ops->set_key(g_hw, DISABLE_KEY, g_vif, 0, C.igtk_key); lx_free(C.igtk_key); C.igtk_key = 0; }\n'
+         '  struct ieee80211_key_conf *kc = lx_alloc(sizeof *kc + 32, 1); if (!kc) return -ENOMEM;\n'
+         '  kc->cipher = WLAN_CIPHER_SUITE_AES_CMAC; kc->keyidx = (s8)C.igtk_id; kc->keylen = 16; kc->icv_len = 8; kc->iv_len = 0;\n'
+         '  kc->hw_key_idx = 0xff; kc->link_id = -1; kc->flags = 0; memcpy(kc->key, C.igtk, 16);\n'
+         '  int r = g_ops->set_key(g_hw, SET_KEY, g_vif, 0, kc);\n'
+         '  if (r < 0) { lx_log(3, "wifi: installing IGTK failed: %d", r); lx_free(kc); return r; }\n'
+         '  C.igtk_key = kc;\n'
+         '  lx_log(6, "wifi: PMF IGTK installed (keyid %u, %s)", C.igtk_id, r > 0 ? "sw-bip" : "hw");\n'
+         '  return 0; }\n'
+         'static void install_keys(void) {\n'
+         '  if (install_key(1, 0, C.ptk + 32, 16)) { connect_done(NW_RES_FAILED); return; }\n'
+         '  if (C.gtk_len && install_key(0, C.gtk_idx, C.gtk, 16)) { connect_done(NW_RES_FAILED); return; }\n'
+         '  if (C.rsn.use_mfp && C.have_igtk && install_igtk() < 0) { connect_done(NW_RES_FAILED); return; }\n'
+         '  C.hs_stage = 4; finish_authorized(); }\n'),
+        ('  if ((info & 7) != 2) { lx_log(4, "wifi: key descriptor version %u not handled", info & 7); return; }\n',
+         '  if (!eapol_ver_ok((u8)(info & 7u))) { lx_log(4, "wifi: key descriptor version %u not handled for akm %u", info & 7u, C.rsn.akm); return; }\n'),
+        ('    memcpy(C.anonce, k->nonce, 32); make_nonce(C.snonce); derive_ptk(); C.replay = be64(k->replay); C.have_replay = 1; C.hs_stage = 1;\n'
+         '    struct eapol_key *o = (void *)buf; memset(o, 0, sizeof *o + 22); o->ver = 2; o->type = 3; o->desc = 2;\n'
+         '    static const u8 rsn[] = { WLAN_EID_RSN, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 2, 0, 0 };\n'
+         '    unsigned body = sizeof *o - 4 + sizeof rsn; o->len[0] = body >> 8; o->len[1] = body; o->info[0] = 0x01; o->info[1] = 0x0a; o->keylen[0] = 0;\n'
+         '    memcpy(o->replay, k->replay, 8); memcpy(o->nonce, C.snonce, 32); o->datalen[0] = 0; o->datalen[1] = sizeof rsn; memcpy(o->data, rsn, sizeof rsn);\n'
+         '    sign(o, sizeof *o + sizeof rsn); send_eapol(o, sizeof *o + sizeof rsn); lx_log(6, "wifi: handshake message 2 sent"); return; }\n',
+         '    if (C.rsn.akm == 8u && C.have_pmkid && dlen > 0) { u8 m1_pmkid[16]; if (pw3_find_pmkid_kde(k->data, dlen, m1_pmkid) == 0 && pw3_ct_memcmp(m1_pmkid, C.pmkid, 16) != 0) lx_log(4, "wifi: M1 PMKID mismatch"); }\n'
+         '    memcpy(C.anonce, k->nonce, 32); make_nonce(C.snonce); derive_ptk(); C.replay = be64(k->replay); C.have_replay = 1; C.hs_stage = 1;\n'
+         '    u8 rsn[80]; size_t rlen = pw3_build_assoc_rsn(&C.rsn, C.have_pmkid ? C.pmkid : 0, rsn, sizeof rsn);\n'
+         '    if (!rlen || sizeof(struct eapol_key) + rlen > sizeof buf) return;\n'
+         '    struct eapol_key *o = (void *)buf; memset(o, 0, sizeof *o + rlen); o->ver = 2; o->type = 3; o->desc = 2;\n'
+         '    unsigned body = sizeof *o - 4 + (unsigned)rlen; o->len[0] = body >> 8; o->len[1] = body;\n'
+         '    o->info[0] = 0x01; o->info[1] = (u8)(0x08u | eapol_out_ver()); o->keylen[0] = 0;\n'
+         '    memcpy(o->replay, k->replay, 8); memcpy(o->nonce, C.snonce, 32); o->datalen[0] = rlen >> 8; o->datalen[1] = rlen; memcpy(o->data, rsn, rlen);\n'
+         '    sign(o, sizeof *o + (unsigned)rlen); send_eapol(o, sizeof *o + (unsigned)rlen); lx_log(6, "wifi: handshake message 2 sent"); return; }\n'),
+        ('  memcpy(buf, p, total); struct eapol_key *c = (void *)buf; u8 want[16], h[20]; memset(c->mic, 0, 16); nw_hmac_sha1(C.ptk, 16, buf, total, h); memcpy(want, h, 16);\n',
+         '  memcpy(buf, p, total); struct eapol_key *c = (void *)buf; u8 want[16]; memset(c->mic, 0, 16); eapol_mic(buf, total, want);\n'),
+        ('    o->info[0] = 0x03; o->info[1] = 0x0a; memcpy(o->replay, k->replay, 8); sign(o, sizeof *o);\n',
+         '    o->info[0] = 0x03; o->info[1] = (u8)(0x08u | eapol_out_ver()); memcpy(o->replay, k->replay, 8); sign(o, sizeof *o);\n'),
+        ('    C.gtk_len = gtk && gtklen >= 16 ? 16 : 0; C.gtk_idx = gtkid; if (C.gtk_len) memcpy(C.gtk, gtk, 16);\n'
+         '    C.hs_stage = 3; C.m4_done = 0; C.m4_at = lx_now_ms();\n',
+         '    C.gtk_len = gtk && gtklen >= 16 ? 16 : 0; C.gtk_idx = gtkid; if (C.gtk_len) memcpy(C.gtk, gtk, 16);\n'
+         '    if (C.rsn.use_mfp) { u16 igid = 0; u8 igpn[6], igtk_b[16]; if (pw3_find_igtk_kde(kd, pl, &igid, igpn, igtk_b) == 0) { C.igtk_id = igid; memcpy(C.igtk_pn, igpn, 6); memcpy(C.igtk, igtk_b, 16); C.have_igtk = 1; } }\n'
+         '    C.hs_stage = 3; C.m4_done = 0; C.m4_at = lx_now_ms();\n'),
+        ('  if (!pairwise && ack) {   /* group key update */\n'
+         '    lx_log(6, "wifi: group key update%s", gtk && gtklen >= 16 ? "" : " without a key");\n'
+         '    if (gtk && gtklen >= 16) install_key(0, gtkid, gtk, 16);\n'
+         '    struct eapol_key *o = (void *)buf; memset(o, 0, sizeof *o); o->ver = 2; o->type = 3; o->desc = 2; unsigned body = sizeof *o - 4; o->len[0] = body >> 8; o->len[1] = body;\n'
+         '    o->info[0] = 0x03; o->info[1] = 0x02; memcpy(o->replay, k->replay, 8); sign(o, sizeof *o); send_eapol(o, sizeof *o); } }\n',
+         '  if (!pairwise && ack) {   /* group key update */\n'
+         '    lx_log(6, "wifi: group key update%s", gtk && gtklen >= 16 ? "" : " without a key");\n'
+         '    if (gtk && gtklen >= 16) install_key(0, gtkid, gtk, 16);\n'
+         '    if (C.rsn.use_mfp) { u16 igid = 0; u8 igpn[6], igtk_b[16]; if (pw3_find_igtk_kde(kd, pl, &igid, igpn, igtk_b) == 0) { C.igtk_id = igid; memcpy(C.igtk_pn, igpn, 6); memcpy(C.igtk, igtk_b, 16); C.have_igtk = 1; install_igtk(); } }\n'
+         '    struct eapol_key *o = (void *)buf; memset(o, 0, sizeof *o); o->ver = 2; o->type = 3; o->desc = 2; unsigned body = sizeof *o - 4; o->len[0] = body >> 8; o->len[1] = body;\n'
+         '    o->info[0] = 0x03; o->info[1] = eapol_out_ver(); memcpy(o->replay, k->replay, 8); sign(o, sizeof *o); send_eapol(o, sizeof *o); } }\n'),
+        ('static void on_mgmt(struct sk_buff *skb) {\n'
+         '  struct ieee80211_mgmt *m = (void *)skb->data; u16 fc = le16_to_cpu(m->frame_control);\n'
+         '  if (memcmp(m->sa, C.ap.bssid, 6)) return;\n'
+         '  if (C.state == NW_STA_AUTH && ieee80211_is_auth(m->frame_control) && skb->len >= 30) {\n'
+         '    u16 status = le16_to_cpu(m->u.auth.status_code), seq = le16_to_cpu(m->u.auth.auth_transaction);\n'
+         '    if (seq != 2) return;\n'
+         '    if (status) { lx_log(4, "wifi: authentication refused: %u", status); connect_done(NW_RES_REJECTED); return; }\n'
+         '    if (set_sta_state(IEEE80211_STA_AUTH)) { connect_done(NW_RES_FAILED); return; }\n'
+         '    C.state = NW_STA_ASSOC; C.tries = 0; C.started = lx_now_ms(); send_assoc(); return; }\n',
+         'static void handle_sae_auth(const u8 *body, unsigned len) {\n'
+         '  pw3_sae_rx rx; if (pw3_parse_sae_auth(body, len, &rx) != 0) return;\n'
+         '  if (rx.seq == 1u) {\n'
+         '    if (rx.status == PW3_SAE_ANTI_CLOG_STATUS) {\n'
+         '      memcpy(C.sae_token, rx.token, rx.token_len); C.sae_token_len = rx.token_len;\n'
+         '      C.tries = 0; lx_log(6, "wifi: SAE anti-clogging token (%u B)", C.sae_token_len); send_sae_commit(); return; }\n'
+         '    if (rx.status == PW3_SAE_H2E_STATUS && !C.sae.use_h2e && !rx.has_scalar_elem) {\n'
+         '      C.rsn.use_h2e = 1u; C.tries = 0; start_sae(1); return; }\n'
+         '    if (rx.status != 0u && rx.status != PW3_SAE_H2E_STATUS) {\n'
+         '      lx_log(4, "wifi: SAE commit refused: %u", rx.status); connect_done(NW_RES_REJECTED); return; }\n'
+         '    if (!rx.has_scalar_elem) return;\n'
+         '    if (C.sae_stage == 2u) {\n'
+         '      if (!memcmp(rx.scalar, C.sae.peer_scalar, 32) && !memcmp(rx.elem, C.sae.peer_elem, 64)) send_sae_confirm();\n'
+         '      return; }\n'
+         '    if (C.sae_stage != 1u) return;\n'
+         '    int rc = pw3_sae_process_peer_commit(&C.sae, rx.scalar, rx.elem);\n'
+         '    if (rc) { lx_log(4, "wifi: SAE peer commit rejected (%d)", rc); connect_done(NW_RES_REJECTED); return; }\n'
+         '    C.sae_stage = 2u; C.tries = 0; send_sae_confirm(); return; }\n'
+         '  if (rx.seq == 2u) {\n'
+         '    if (rx.status != 0u) { lx_log(4, "wifi: SAE confirm refused: %u", rx.status); connect_done(NW_RES_BAD_KEY); return; }\n'
+         '    if (C.sae_stage != 2u || !rx.has_confirm) return;\n'
+         '    if (pw3_sae_verify_confirm(&C.sae, rx.send_confirm, rx.confirm) != 0) {\n'
+         '      lx_log(4, "wifi: SAE confirm mismatch (wrong passphrase?)"); connect_done(NW_RES_BAD_KEY); return; }\n'
+         '    memcpy(C.pmk, C.sae.pmk, 32); memcpy(C.pmkid, C.sae.pmkid, 16); C.have_pmkid = 1u;\n'
+         '    pw3_sae_wipe(&C.sae); C.sae_stage = 3u;\n'
+         '    if (set_sta_state(IEEE80211_STA_AUTH)) { connect_done(NW_RES_FAILED); return; }\n'
+         '    C.state = NW_STA_ASSOC; C.tries = 0; C.started = lx_now_ms(); send_assoc(); return; } }\n'
+         'static void on_mgmt(struct sk_buff *skb) {\n'
+         '  struct ieee80211_mgmt *m = (void *)skb->data; u16 fc = le16_to_cpu(m->frame_control);\n'
+         '  if (memcmp(m->sa, C.ap.bssid, 6)) return;\n'
+         '  if (C.state == NW_STA_AUTH && ieee80211_is_auth(m->frame_control) && skb->len >= 30) {\n'
+         '    if (C.secure && C.rsn.akm == 8u) { handle_sae_auth(skb->data + 24, skb->len - 24); return; }\n'
+         '    if (le16_to_cpu(m->u.auth.auth_alg) != 0u) return;\n'
+         '    u16 status = le16_to_cpu(m->u.auth.status_code), seq = le16_to_cpu(m->u.auth.auth_transaction);\n'
+         '    if (seq != 2) return;\n'
+         '    if (status) { lx_log(4, "wifi: authentication refused: %u", status); connect_done(NW_RES_REJECTED); return; }\n'
+         '    if (set_sta_state(IEEE80211_STA_AUTH)) { connect_done(NW_RES_FAILED); return; }\n'
+         '    C.state = NW_STA_ASSOC; C.tries = 0; C.started = lx_now_ms(); send_assoc(); return; }\n'),
+        ('  if ((ieee80211_is_deauth(m->frame_control) || ieee80211_is_disassoc(m->frame_control)) && C.state >= NW_STA_AUTH) {\n'
+         '    u16 reason = le16_to_cpu(m->u.deauth.reason_code); lx_log(4, "wifi: access point ended the connection: reason %u (%s)", reason, tx_reasons()); nw_wifi_htt_stats(8);\n'
+         '    if (C.state == NW_STA_UP) { teardown(1, reason); } else connect_done(NW_RES_REJECTED); }\n',
+         '  if ((ieee80211_is_deauth(m->frame_control) || ieee80211_is_disassoc(m->frame_control)) && C.state >= NW_STA_AUTH) {\n'
+         '    const char *kind = ieee80211_is_deauth(m->frame_control) ? "deauth" : "disassoc";\n'
+         '    struct ieee80211_rx_status *st = IEEE80211_SKB_RXCB(skb);\n'
+         '    u16 reason = 0;\n'
+         '    if (C.rsn.use_mfp && C.ptk_ready) {\n'
+         '      if (is_multicast_ether_addr(m->da)) {\n'
+         '        if (ieee80211_has_protected(m->frame_control) || !C.have_igtk ||\n'
+         '            pw3_bip_cmac128_verify(C.igtk, C.igtk_id, C.igtk_pn, skb->data, skb->len) != 0) {\n'
+         '          lx_log(4, "wifi: dropped unverified broadcast %s", kind); return; }\n'
+         '        if (skb->len < 26) return;\n'
+         '        reason = (u16)(skb->data[24] | (skb->data[25] << 8));\n'
+         '      } else {\n'
+         '        if (!ieee80211_has_protected(m->frame_control)) {\n'
+         '          lx_log(4, "wifi: dropped unprotected unicast %s", kind); return; }\n'
+         '        if (!(st->flag & RX_FLAG_DECRYPTED)) {\n'
+         '          lx_log(4, "wifi: dropped undecrypted protected %s", kind); return; }\n'
+         '        unsigned off = (st->flag & RX_FLAG_IV_STRIPPED) ? 24u : 32u;\n'
+         '        unsigned minl = (st->flag & RX_FLAG_IV_STRIPPED) ? 26u : 42u;\n'
+         '        if (skb->len < minl) return;\n'
+         '        reason = (u16)(skb->data[off] | (skb->data[off + 1] << 8));\n'
+         '      }\n'
+         '    } else {\n'
+         '      if (skb->len < 26) return;\n'
+         '      reason = (u16)(skb->data[24] | (skb->data[25] << 8));\n'
+         '    }\n'
+         '    lx_log(4, "wifi: access point ended the connection: %s reason %u (%s)", kind, reason, tx_reasons()); nw_wifi_htt_stats(8);\n'
+         '    if (C.state == NW_STA_UP) { teardown(1, reason); } else connect_done(NW_RES_REJECTED); }\n'),
+        ('  if (ieee80211_is_action(h->frame_control) && skb->len >= 26 && !memcmp(h->addr2, C.ap.bssid, 6)) {\n'
+         '    const u8 *a = skb->data + 24; nw_wifi_t970_rxd[0]++;\n'
+         '    if (a[0] == WLAN_CATEGORY_BACK) { nw_wifi_t970_rxd[1]++;\n'
+         '      if (a[1] == WLAN_ACTION_ADDBA_REQ) nw_wifi_t970_rxd[2]++;\n'
+         '      if (C.sta && C.state >= NW_STA_KEYS) t970_back(a, skb->len - 24); } }\n',
+         '  if (ieee80211_is_action(h->frame_control) && skb->len >= 26 && !memcmp(h->addr2, C.ap.bssid, 6)) {\n'
+         '    struct ieee80211_rx_status *ast = IEEE80211_SKB_RXCB(skb);\n'
+         '    unsigned aoff = 24u, atrim = 24u;\n'
+         '    if (ieee80211_has_protected(h->frame_control)) {\n'
+         '      if (!(ast->flag & RX_FLAG_DECRYPTED)) return;\n'
+         '      if (!(ast->flag & RX_FLAG_IV_STRIPPED)) { aoff = 32u; atrim = 40u; }\n'
+         '    }\n'
+         '    if (skb->len >= atrim + 2u) {\n'
+         '      const u8 *a = skb->data + aoff; nw_wifi_t970_rxd[0]++;\n'
+         '      if (a[0] == WLAN_CATEGORY_BACK) { nw_wifi_t970_rxd[1]++;\n'
+         '        if (a[1] == WLAN_ACTION_ADDBA_REQ) nw_wifi_t970_rxd[2]++;\n'
+         '        if (C.sta && C.state >= NW_STA_KEYS) t970_back(a, skb->len - atrim); } } }\n'),
+        ('    if (C.ptk_key) { g_ops->set_key(g_hw, DISABLE_KEY, g_vif, C.sta, C.ptk_key); lx_free(C.ptk_key); C.ptk_key = 0; }\n'
+         '    if (C.gtk_key) { g_ops->set_key(g_hw, DISABLE_KEY, g_vif, 0, C.gtk_key); lx_free(C.gtk_key); C.gtk_key = 0; }\n',
+         '    if (C.ptk_key) { g_ops->set_key(g_hw, DISABLE_KEY, g_vif, C.sta, C.ptk_key); lx_free(C.ptk_key); C.ptk_key = 0; }\n'
+         '    if (C.gtk_key) { g_ops->set_key(g_hw, DISABLE_KEY, g_vif, 0, C.gtk_key); lx_free(C.gtk_key); C.gtk_key = 0; }\n'
+         '    if (C.igtk_key) { g_ops->set_key(g_hw, DISABLE_KEY, g_vif, 0, C.igtk_key); lx_free(C.igtk_key); C.igtk_key = 0; }\n'),
+        ('  g_vif->bss_conf.bssid = g_no_bssid; C.ptk_ready = 0; C.hs_stage = 0; C.have_replay = 0; C.chanctx_up = 0;\n',
+         '  g_vif->bss_conf.bssid = g_no_bssid; C.ptk_ready = 0; C.hs_stage = 0; C.have_replay = 0; C.chanctx_up = 0;\n'
+         '  pw3_sae_wipe(&C.sae); pw3_ct_zero(C.pmk, sizeof C.pmk); pw3_ct_zero(C.ptk, sizeof C.ptk);\n'
+         '  pw3_ct_zero(C.pass, sizeof C.pass); pw3_ct_zero(C.igtk, sizeof C.igtk); pw3_ct_zero(C.pmkid, sizeof C.pmkid);\n'
+         '  C.pass_len = 0; C.have_pmkid = 0; C.have_igtk = 0; C.sae_stage = 0; C.sae_token_len = 0; memset(&C.rsn, 0, sizeof C.rsn);\n'),
+        ('  const u8 *rsn = find_rsn(C.ap.ie, C.ap.ie_len); C.secure = g_req.has_pass;\n'
+         '  if (C.secure) {\n'
+         '    if (rsn_check(rsn)) { lx_log(4, "wifi: network security not supported"); connect_done(NW_RES_UNSUPPORTED); return; }\n'
+         '    if (g_req.pass_len == 64) { for (int i = 0; i < 32; i++) { unsigned v; const char *s = g_req.pass + 2 * i; int hi = (s[0] <= \'9\' ? s[0] - \'0\' : (s[0] | 32) - \'a\' + 10), lo = (s[1] <= \'9\' ? s[1] - \'0\' : (s[1] | 32) - \'a\' + 10); v = hi << 4 | lo; C.pmk[i] = v; } }\n'
+         '    else nw_pbkdf2_sha1(g_req.pass, g_req.pass_len, C.ssid, C.ssid_len, 4096, C.pmk, 32);\n'
+         '  } else if (rsn) { lx_log(4, "wifi: network needs a passphrase"); connect_done(NW_RES_BAD_KEY); return; }\n',
+         '  const u8 *rsn = find_rsn(C.ap.ie, C.ap.ie_len); C.secure = g_req.has_pass;\n'
+         '  memset(&C.rsn, 0, sizeof C.rsn); C.have_pmkid = 0; C.have_igtk = 0; C.sae_stage = 0; C.sae_token_len = 0; pw3_sae_wipe(&C.sae);\n'
+         '  if (C.secure) {\n'
+         '    if (g_req.pass_len <= 0 || g_req.pass_len > 64) { connect_done(NW_RES_BAD_KEY); return; }\n'
+         '    if (rsn_check(rsn)) { lx_log(4, "wifi: network security not supported"); connect_done(NW_RES_UNSUPPORTED); return; }\n'
+         '    memcpy(C.pass, g_req.pass, (size_t)g_req.pass_len); C.pass_len = g_req.pass_len;\n'
+         '    if (C.rsn.akm != 8u) {\n'
+         '      int hex64 = (g_req.pass_len == 64);\n'
+         '      for (int i = 0; hex64 && i < 64; i++) { char ch = g_req.pass[i]; if (!((ch >= \'0\' && ch <= \'9\') || ((ch | 32) >= \'a\' && (ch | 32) <= \'f\'))) hex64 = 0; }\n'
+         '      if (hex64) { for (int i = 0; i < 32; i++) { const char *s = g_req.pass + 2 * i; int hi = (s[0] <= \'9\' ? s[0] - \'0\' : (s[0] | 32) - \'a\' + 10), lo = (s[1] <= \'9\' ? s[1] - \'0\' : (s[1] | 32) - \'a\' + 10); C.pmk[i] = (u8)((hi << 4) | lo); } }\n'
+         '      else nw_pbkdf2_sha1(g_req.pass, g_req.pass_len, C.ssid, C.ssid_len, 4096, C.pmk, 32); }\n'
+         '    lx_log(6, "wifi: security akm %u mfp %u (ap mfpc %u mfpr %u) h2e %u", C.rsn.akm, C.rsn.use_mfp, C.rsn.mfpc, C.rsn.mfpr, C.rsn.use_h2e);\n'
+         '  } else if (rsn) { lx_log(4, "wifi: network needs a passphrase"); connect_done(NW_RES_BAD_KEY); return; }\n'),
+    ])
     return qrtr
 
 
@@ -584,8 +877,8 @@ void ieee80211_queue_work(struct ieee80211_hw *hw, struct work_struct *work) { i
         '-nostdinc', '-isystem', str(shared / 'shim/libc'), '-isystem', resource,
         '-I', str(overlay), '-include', 'PongCompat.h', '-I', str(shared / 'shim/include'),
         '-I', str(shared / 'include'), '-I', str(pinned), '-I', str(shared / 'src'),
-        '-I', str(gen), '-I', str(out), '-I', str(source.parent), '-DCONFIG_ATH11K_PCI=1',
-        '-DLX_BOOT_SETTLE_MS=0']
+        '-I', str(gen), '-I', str(out), '-I', str(source.parent), '-I', str(ROOT / 'drivers/T970Wifi'),
+        '-DCONFIG_ATH11K_PCI=1', '-DLX_BOOT_SETTLE_MS=0']
     ath = 'core hal hal_tx hal_rx wmi mac reg htc qmi dp dp_tx dp_rx ce peer dbring hw pcic fw p2p mhi pci'.split()
     jobs = [(gen / (n + '.c'), out / ('ath11k_' + n + '.o'), []) for n in ath]
     jobs += [(mhi / (n + '.c'), out / ('mhi_' + n + '.o'), ['-I', str(mhi)]) for n in ('init', 'main', 'pm', 'boot')]
@@ -608,6 +901,7 @@ void ieee80211_queue_work(struct ieee80211_hw *hw, struct work_struct *work) { i
                     'shim/src/lx_rt.c': out / 'lx_rt_pong.c'}
     if a.t970: replacements['src/nw_qrtr.c'] = t970_edits(gen, mhi, shared, out)
     jobs += [(replacements.get(n, shared / n), out / ('shared_' + Path(n).stem + '.o'), []) for n in common_sources]
+    if a.t970: jobs += [(ROOT / 'drivers/T970Wifi/T970WifiWpa3.c', out / 'T970WifiWpa3.o', [])]
     jobs += [(linux / ('drivers/soc/qcom/' + n + '.c'), out / (n + '.o'), []) for n in ('qmi_interface', 'qmi_encdec')]
     jobs += [(ROOT / 'drivers/PongWifi/ath11k/PongAth11k.c', out / 'PongAth11k.o', [])]
     commands = []
