@@ -20,8 +20,9 @@ name: kernel-precheck
 # lists every compile error of the XNU stage. The driver builders run before
 # that make and still stop at their own first failure.
 #
-# Its concurrency group is its own: it never cancels a package run, and a newer
-# precheck of the same ref replaces an older one. It reads the package job's XNU
+# Its concurrency group is its own and per commit: it never cancels a package run, and
+# every pushed commit gets a finished result (11-17: 10 of 30 runs were cancelled by the
+# next push, so each session waited again for its own patch). It reads the package job's XNU
 # tree cache without writing it, and keeps a ccache of its own (ccache-precheck-*).
 #
 #   gh workflow run kernel-precheck.yml --repo kmu1757/UniXNU-t970 [--ref <branch>]
@@ -41,8 +42,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: kernel-precheck-${{ github.ref }}
-  cancel-in-progress: true
+  group: kernel-precheck-${{ github.sha }}
+  cancel-in-progress: false
 
 env:
   OS_PROFILE: ipados-18.7.10-22H374
