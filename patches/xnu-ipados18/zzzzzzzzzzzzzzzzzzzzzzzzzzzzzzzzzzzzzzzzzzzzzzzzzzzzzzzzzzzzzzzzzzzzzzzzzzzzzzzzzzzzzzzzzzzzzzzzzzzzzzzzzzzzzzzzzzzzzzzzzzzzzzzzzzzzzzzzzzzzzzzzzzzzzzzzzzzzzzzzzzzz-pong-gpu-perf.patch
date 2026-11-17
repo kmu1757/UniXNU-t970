@@ -1,0 +1,207 @@
+diff --git a/bsd/dev/adreno/A650Gmu.c b/bsd/dev/adreno/A650Gmu.c
+index 2eaced2..319dd8e 100644
+--- a/bsd/dev/adreno/A650Gmu.c
++++ b/bsd/dev/adreno/A650Gmu.c
+@@ -359,6 +359,18 @@ A650GmuStatus A650GmuPowerGx(A650GmuDevice *d, unsigned perf_index, A650GmuGxRes
+     return status;
+ }
+ 
++A650GmuStatus A650GmuVotePerf(A650GmuDevice *d, unsigned perf_index, uint32_t *firmware_error)
++{
++    if (!d || !firmware_error || perf_index < 1 || perf_index > 7) return A650GmuArgument;
++    *firmware_error = 0;
++    if (d->poisoned || d->hfi.poisoned) return A650GmuPoisoned;
++    if (!d->startup.completed) return A650GmuStateMismatch;
++    const uint32_t vote[3] = {1, perf_index, A650GmuDdrVote ? 1u : 0u};
++    uint32_t out[16]; size_t count = 0;
++    const AdrenoHfiStatus s = AdrenoHfiExchange(&d->hfi, 30, vote, 3, 1000, hfi_wait, out, 16, &count, firmware_error);
++    return s == AdrenoHfiSuccess ? A650GmuSuccess : s == AdrenoHfiFirmwareError ? A650GmuProtocolError : A650GmuTimeout;
++}
++
+ AdrenoHfiStartupStatus A650GmuBuildStartup(const uint8_t *gfx, size_t gfx_bytes, const uint8_t *mx, size_t mx_bytes,
+     const uint8_t *cx, size_t cx_bytes, uint32_t mc0, uint32_t sh0, uint32_t acv, uint32_t cn0, AdrenoHfiStartupConfig *out)
+ {
+diff --git a/bsd/dev/adreno/A650Gmu.h b/bsd/dev/adreno/A650Gmu.h
+index 84c690e..5ccf53c 100644
+--- a/bsd/dev/adreno/A650Gmu.h
++++ b/bsd/dev/adreno/A650Gmu.h
+@@ -85,6 +85,9 @@ typedef struct {
+ /* Nonzero: the bandwidth table gets a top DDR level and GX power votes it (A650Gmu.c). Set before A650GmuBuildStartup. */
+ extern unsigned A650GmuDdrVote;
+ A650GmuStatus A650GmuPowerGx(A650GmuDevice *, unsigned perf_index, A650GmuGxResult *);
++/* With GX on: another GPU level, as Linux a6xx_gmu_set_freq does it for a non-legacy GMU (a6xx_hfi_set_freq): GX_BW_PERF_VOTE
++ * {ack_type 1, perf_index, bandwidth} alone, no OOB. *firmware_error gets the GMU's error word. */
++A650GmuStatus A650GmuVotePerf(A650GmuDevice *, unsigned perf_index, uint32_t *firmware_error);
+ /* The HFI tables for pipa: the GPU levels of the DTS gpu-opp-table_v2 (305 to 670 MHz, RPMh levels 64 to 320) and the GMU's
+  * 200 MHz at MIN_SVS (48), each with an off entry, voted from the command DB's gfx/mx and cx/mx level lists (16-bit words);
+  * the bandwidth table is a650_build_bw_table's single "off" level, with the BCM addresses from the command DB instead of
+diff --git a/bsd/dev/pong_cpu_perf.c b/bsd/dev/pong_cpu_perf.c
+index 54d85a6..5f25500 100644
+--- a/bsd/dev/pong_cpu_perf.c
++++ b/bsd/dev/pong_cpu_perf.c
+@@ -142,6 +142,14 @@ hottest_dc(void)
+ 	return hot;
+ }
+ 
++/* z162: the GPU level governor of pong_gpu_gmu.c reads the same sensors. */
++int pong_tsens_hot_dc(void);
++int
++pong_tsens_hot_dc(void)
++{
++	return hottest_dc();
++}
++
+ /* Mode 4 (or `cpuperf park 1`): CPUs 7..4 off once dark idle has lasted 30 s (one attempt per dark spell), on again
+  * as soon as it ends. A CPU that does not come back is dropped from the mask and its error kept. */
+ static void
+diff --git a/bsd/dev/pong_gpu_gmu.c b/bsd/dev/pong_gpu_gmu.c
+index 3d60271..b56838c 100644
+--- a/bsd/dev/pong_gpu_gmu.c
++++ b/bsd/dev/pong_gpu_gmu.c
+@@ -44,6 +44,8 @@
+ #if defined(PONG)
+ #include <kern/clock.h>
+ #include <kern/kalloc.h>
++#include <kern/thread.h>
++#include <libkern/OSAtomic.h>
+ #include <libkern/libkern.h>
+ #include <mach/mach_types.h>
+ #include <mach/vm_param.h>
+@@ -66,6 +68,7 @@ extern vm_offset_t g_cmd_db_page;   /* pong_gpu_probe.c: mode 6 maps the AOP com
+ int pong_gpu_gmu_start(char *reply, size_t cap);
+ int pong_gpu_gmu_attempted(void);
+ int pong_gpu_gmu_gx(unsigned perf, char *reply, size_t cap);
++int pong_gpu_gmu_perf(int perf, char *reply, size_t cap);   /* z162 */
+ int pong_gpu_cp_init(char *reply, size_t cap);
+ int pong_gpu_cp_zap(char *reply, size_t cap);
+ int pong_gpu_zap_auth(char *reply, size_t cap);
+@@ -517,6 +520,13 @@ pong_gpu_gmu_start(char *reply, size_t cap)
+ 			return -1;
+ 		}
+ 	}
++	{   /* z162: pong_gpu_ddr=1 votes the top DDR level with the GPU's (A650Gmu.c); the tables are built once, here */
++		unsigned ddr = 0;
++
++		if (PE_parse_boot_argn("pong_gpu_ddr", &ddr, sizeof(ddr)) && ddr) {
++			A650GmuDdrVote = 1;
++		}
++	}
+ 	if (A650GmuBuildStartup(gg.aux[0], gg.aux_len[0], gg.aux[1], gg.aux_len[1], gg.aux[2], gg.aux_len[2],
+ 	    gg.bcm[0], gg.bcm[1], gg.bcm[2], gg.bcm[3], &gg.startup) != AdrenoHfiStartupSuccess) {
+ 		snprintf(reply, cap, " gmustart[stop=hfi_tables aux=%u/%u/%u]", gg.aux_len[0], gg.aux_len[1], gg.aux_len[2]);
+@@ -605,9 +615,89 @@ pong_gpu_gmu_gx(unsigned perf, char *reply, size_t cap)
+ 		    gg_rd(cb, GG_CB_FSR), gg_rd(cb, GG_CB_FAR + 4), gg_rd(cb, GG_CB_FAR), gg_rd(cb, GG_CB_FSYNR0),
+ 		    gg_rd(gg.smmu, 0x48), gg_rd(gg.smmu, 0x50));
+ 	}
++	if (gg_gx_ok) {   /* z162: the level the boot asks for, through the governor below */
++		unsigned want = 0;
++		char perf_reply[200];
++
++		if (PE_parse_boot_argn("pong_gpu_perf", &want, sizeof(want)) && want > 1 && want <= 7) {
++			(void)pong_gpu_gmu_perf((int)want, perf_reply, sizeof(perf_reply));
++		}
++	}
+ 	return st == A650GmuSuccess ? 0 : -1;
+ }
+ 
++/*
++ * z162: the GPU level. GX comes up at level 1 (305 MHz), as before. Boot-arg pong_gpu_perf=N (2..7: 400, 441.6, 490, 525, 587,
++ * 670 MHz) or USB `gpuprobe perf N` sets a target; a thread then climbs one level per 500 ms toward it and, like the CPU governor,
++ * steps one level down per 500 ms while the hottest TSENS bank-0 sensor (CPU cores, cpuss, gpuss-0) is above pong_thermal_c
++ * (default 85 C), holding within 5 C of it. The thread alone sends the votes (A650GmuVotePerf). pong_gpu_ddr=1 (before gmustart)
++ * gives the bandwidth table its top DDR level, voted with every level. No DCVS: the level holds while the GPU idles.
++ */
++extern int pong_tsens_hot_dc(void);
++static volatile uint32_t gp_target = 1, gp_started;
++static uint32_t gp_level = 1, gp_votes, gp_throttles, gp_err, gp_fwerr, gp_limit = 85;
++static volatile int gp_hot = -32768;
++
++static void
++gp_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	for (;;) {
++		const int hot = pong_tsens_hot_dc();
++		uint32_t want = gp_level < gp_target ? gp_level + 1 : gp_target;
++
++		gp_hot = hot;
++		if (hot > (int)gp_limit * 10) {
++			want = gp_level > 1 ? gp_level - 1 : 1;
++			gp_throttles += want < gp_level;
++		} else if (hot >= ((int)gp_limit - 5) * 10 && want > gp_level) {
++			want = gp_level;
++		}
++		if (want != gp_level) {
++			uint32_t fw = 0;
++			const A650GmuStatus st = A650GmuVotePerf(&gg.dev, want, &fw);
++
++			if (st == A650GmuSuccess) {
++				gp_level = want;
++				gp_votes++;
++			} else {
++				gp_err = (uint32_t)st;
++				gp_fwerr = fw;
++				if (st == A650GmuPoisoned || st == A650GmuTimeout) {
++					return;   /* the HFI session is gone: the level stays where it is */
++				}
++			}
++		}
++		delay_for_interval(500, 1000000u);
++	}
++}
++
++/* perf 1..7 sets the target (starting the thread once GX is on); any other value only reports */
++int
++pong_gpu_gmu_perf(int perf, char *reply, size_t cap)
++{
++	static const uint16_t mhz[8] = {0, 305, 400, 441, 490, 525, 587, 670};
++
++	if (perf >= 1 && perf <= 7) {
++		if (!gg_gx_ok) {
++			snprintf(reply, cap, "gpuperf: stop=gx_off\n");
++			return -1;
++		}
++		gp_target = (uint32_t)perf;
++		if (OSCompareAndSwap(0, 1, &gp_started)) {
++			thread_t th = THREAD_NULL;
++
++			(void)PE_parse_boot_argn("pong_thermal_c", &gp_limit, sizeof(gp_limit));
++			if (kernel_thread_start(gp_thread, NULL, &th) == KERN_SUCCESS) {
++				thread_deallocate(th);
++			}
++		}
++	}
++	snprintf(reply, cap, "gpuperf: level=%u (%u MHz) target=%u ddr=%u hot=%d.%dC limit=%uC votes=%u throttles=%u err=%u fw=%#x thread=%u\n",
++	    gp_level, mhz[gp_level & 7], gp_target, A650GmuDdrVote, gp_hot / 10, (gp_hot < 0 ? -gp_hot : gp_hot) % 10, gp_limit, gp_votes,
++	    gp_throttles, gp_err, gp_fwerr, gp_started);
++	return 0;
++}
++
+ /* ---- stage C1: the GPU's context, hw_init, SQE, ring 0, CP_ME_INIT, one CP_MEM_WRITE ---- */
+ #define GC_CORE_PHYS    0x03d00000UL         /* qcom,kgsl-3d0 */
+ #define GC_CORE_BYTES   0x40000UL            /* dword registers up to 0xffff (SECVID 0xf810) */
+diff --git a/bsd/dev/pong_usb_ctl.c b/bsd/dev/pong_usb_ctl.c
+index 861f25b..17511e0 100644
+--- a/bsd/dev/pong_usb_ctl.c
++++ b/bsd/dev/pong_usb_ctl.c
+@@ -107,6 +107,7 @@ extern int pong_wifi_tools_fileraw(char *reply, size_t cap, const char *args, co
+ extern int pong_proc_diag_usb(char *reply, size_t cap, const char *cmd);   /* `exits`, `ps`, `filels` (pong_wifi_tools.c) */
+ extern int pong_launch_policy_usb(char *reply, size_t cap, const char *args);   /* `launchpolicy [write|clear]` */
+ extern int pong_gpu_gmu_gx(unsigned perf, char *reply, size_t cap);   /* `gpuprobe gxon` (pong_gpu_gmu.c) */
++extern int pong_gpu_gmu_perf(int perf, char *reply, size_t cap);   /* z162 `gpuprobe perf [1..7]` (pong_gpu_gmu.c) */
+ extern int pong_gpu_cp_init(char *reply, size_t cap);                 /* `gpuprobe cpinit` (pong_gpu_gmu.c) */
+ extern int pong_gpu_cp_zap(char *reply, size_t cap);                  /* `gpuprobe cpzap` (pong_gpu_gmu.c) */
+ extern int pong_t970_gpu_start(char *reply, size_t cap);              /* `gpuprobe gpustart` (PongAdrenoCpT970.cpp) */
+@@ -2826,6 +2827,13 @@ dispatch_command(const char *cmd)
+ 		ga_reply[0] = '\0';
+ 		(void)pong_gpu_tools_usb(ga_reply, sizeof(ga_reply), strcmp(cmd, "gpusave") == 0);
+ 		send_str(ga_reply[0] ? ga_reply : "gpuauto: no reply\n");
++	} else if (strcmp(cmd, "gpuprobe perf") == 0 || strncmp(cmd, "gpuprobe perf ", 14) == 0) {
++		char perf_reply[200];
++		const char *p = cmd + 13;
++
++		perf_reply[0] = '\0';
++		(void)pong_gpu_gmu_perf(*p ? (int)parse_uint(&p) : 0, perf_reply, sizeof(perf_reply));
++		send_str(perf_reply);
+ 	} else if (strcmp(cmd, "gpuprobe selftest") == 0) {
+ 		static char st_reply[512];
+ 
