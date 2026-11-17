@@ -536,6 +536,9 @@ jobs:
           PONG_VOLUME_LAYOUT: ${{ github.workspace }}/ci-volume-layout.json
           PONG_LLVM: ${{ env.LLVM_KEG }}/bin
           CCACHE_DIR: ${{ env.CCACHE_DIR }}
+          # prepare-xnu-source.py asks api.github.com for Apple's DriverKit headers; anonymous calls share the runner
+          # address's quota and failed twice on 11-17 (HTTP 403 rate limit). The script sends this only to GitHub hosts.
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           ncpu=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
