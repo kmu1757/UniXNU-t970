@@ -1,0 +1,87 @@
+diff --git a/bsd/dev/pong_wifi_link.c b/bsd/dev/pong_wifi_link.c
+index db16eb0..2358829 100644
+--- a/bsd/dev/pong_wifi_link.c
++++ b/bsd/dev/pong_wifi_link.c
+@@ -422,6 +422,15 @@ wl_rails(struct wl *w)
+ 		uint32_t address = wl_cmddb_addr(wl_rail[i].name);
+ 		int rc = address ? 0 : 1;
+ 		unsigned k = 0;
++		{
++			/* which vote was last before a stop: the RSC's other writers (haptic, slpi, fts) share these TCSes */
++			char line[40];
++			int n = snprintf(line, sizeof(line), "[PONG_WIFI] L10r%u L10r%u %s\n", i, i, wl_rail[i].name);
++
++			if (n > 0) {
++				pong_ramoops_diagnostic_write(line, n < (int)sizeof(line) ? n : (int)sizeof(line) - 1);
++			}
++		}
+ 
+ 		for (; !rc && k < 3; k++) {
+ 			rc = wl_rpmh(address + vote[k].word, k ? vote[k].value : wl_rail[i].mv);
+diff --git a/bsd/dev/pong_wifi_stack.c b/bsd/dev/pong_wifi_stack.c
+index 6b45573..0eaf0ce 100644
+--- a/bsd/dev/pong_wifi_stack.c
++++ b/bsd/dev/pong_wifi_stack.c
+@@ -626,13 +626,19 @@ ws_run(void)
+ {
+ 	uint32_t v = 0;
+ 
++	/* pmsg marks before each stage (11-19 half100m: a stop around the start with nothing in pstore to say where) */
++	ws_log(6, "w1a w1a link");
+ 	WS_STAGE(1, pong_wifi_link_up(ws.stage_line, sizeof(ws.stage_line)));
+ 	delay_for_interval(3000, 1000000u);             /* as the hand-driven runs: `wifimhi` 3 s after `wifiup` */
++	ws_log(6, "w2a w2a mhi");
+ 	WS_STAGE(2, pong_wifi_mhi_read(ws.stage_line, sizeof(ws.stage_line)));
++	ws_log(6, "w3a w3a smmu");
+ 	WS_STAGE(3, pong_wifi_stage3b(ws.stage_line, sizeof(ws.stage_line), 0));
+ 	WS_STAGE(4, pong_wifi_stage3b(ws.stage_line, sizeof(ws.stage_line), 1));
++	ws_log(6, "w7a w7a window");
+ 	WS_STAGE(7, ws_window() ? 0 : -1);
+ 	pong_wifi_stack_table(ws.table_pa);             /* `wifis3b bank` loads this table instead of its own */
++	ws_log(6, "w5a w5a bank");
+ 	WS_STAGE(5, pong_wifi_stage3b(ws.stage_line, sizeof(ws.stage_line), 2));
+ 	WS_STAGE(6, pong_wifi_stage3b(ws.stage_line, sizeof(ws.stage_line), 3));
+ 	ws.stage_line[0] = '\0';
+@@ -671,6 +677,11 @@ ws_run(void)
+ 		.msi_target = ws_msi_target, .map_phys = ws_map_phys,
+ 	};
+ 	WS_STAGE(11, t970_wifi_net_prepare());         /* the station events get their handlers before the start */
++	if (!pong_wifi_link_ok(ws.stage_line, sizeof(ws.stage_line))) {   /* the module reads BAR0 from its first steps */
++		ws.stage = -9;
++		ws_log(3, ws.stage_line);
++		return;
++	}
+ 	ws_log(6, "w9a w9a start");                    /* next: the module's own lines, `pci: device control` first */
+ 	WS_STAGE(9, nw_wifi_start(&ws_platform, &ws_board));
+ 	ws_log(6, "w9b w9b started");
+diff --git a/bsd/dev/pong_wifi_tools.c b/bsd/dev/pong_wifi_tools.c
+index 30831f5..6c813e3 100644
+--- a/bsd/dev/pong_wifi_tools.c
++++ b/bsd/dev/pong_wifi_tools.c
+@@ -420,6 +420,8 @@ fw_auto_thread(__unused void *arg, __unused wait_result_t wr)
+ 			delay_for_interval(90000, 1000000u);
+ 		}
+ 	}
++	/* pmsg marks between the steps (11-19 half100m stopped between +86 s and +139 s, around this start); each tag twice */
++	native_wifi_logf(6, "wa1 wa1 wait over");
+ 	/* the Data volume appears some tens of seconds after boot; try every 2 s for up to 5 minutes */
+ 	for (wt.auto_tries = 0; wt.auto_tries < 150; wt.auto_tries++) {
+ 		delay_for_interval(2000, 1000000u);
+@@ -434,6 +436,7 @@ fw_auto_thread(__unused void *arg, __unused wait_result_t wr)
+ 		    wt.last_rc, wt.auto_tries);
+ 		wt_idle_forever();
+ 	}
++	native_wifi_logf(6, "wa2 wa2 firmware read (%d tries)", wt.auto_tries + 1);
+ 	{
+ 		uint32_t lp = 1;
+ 
+@@ -442,7 +445,9 @@ fw_auto_thread(__unused void *arg, __unused wait_result_t wr)
+ 		    lp && !lp_bt_served() ? ", bluetoothd too" : "", lp_write(lp != 0));
+ 	}
+ 	reply[0] = '\0';
++	native_wifi_logf(6, "wa3 wa3 mac");
+ 	wifi_mac_prepare();
++	native_wifi_logf(6, "wa4 wa4 stack");
+ 	(void)pong_wifi_stack_usb(reply, sizeof(reply), 1);
+ 	wt.auto_state = 2;
+ 	native_wifi_logf(6, "wifi-auto: firmware loaded from the Data volume after %d tries (%u+%u+%u+%u bytes); %s",
